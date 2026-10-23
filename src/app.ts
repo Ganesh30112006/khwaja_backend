@@ -1,3 +1,5 @@
+import { timingSafeEqual } from 'node:crypto';
+import compression from 'compression';
 import cors from 'cors';
 import express, { type ErrorRequestHandler } from 'express';
 import helmet from 'helmet';
@@ -18,6 +20,8 @@ export function createApp() {
   app.disable('x-powered-by');
   if (config.trustProxy) app.set('trust proxy', config.trustProxy);
   app.use(helmet());
+  // Large lists and exports are JSON; gzip makes them about 10x smaller over mobile networks.
+  app.use(compression());
   // Same-origin deployments need no CORS; otherwise list the frontend origins in CORS_ORIGINS.
   if (config.corsOrigins.length) app.use(cors({ origin: config.corsOrigins, allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'] }));
   app.use(express.json({ limit: '1mb' }));
@@ -27,6 +31,15 @@ export function createApp() {
     await pool.query('SELECT 1');
     res.json({ ok: true });
   });
+
+  if (config.originSecret) {
+    const expected = Buffer.from(config.originSecret);
+    app.use('/api', (req, res, next) => {
+      const given = Buffer.from(req.get('x-origin-verify') ?? '');
+      if (given.length === expected.length && timingSafeEqual(given, expected)) return next();
+      res.status(403).json({ message: 'Forbidden.', code: 'FORBIDDEN' });
+    });
+  }
 
   const api = express.Router();
   for (const router of [authRouter, adminsRouter, wardsRouter, votersRouter, importsRouter, paymentsRouter, settingsRouter, reportsRouter]) api.use(router);

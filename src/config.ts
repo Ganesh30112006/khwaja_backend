@@ -30,6 +30,8 @@ export const config = {
   /** Calendar used for date filters, "today" and daily/monthly report groups. */
   timeZone: timeZone(),
   loginRateLimit: Number(process.env.LOGIN_RATE_LIMIT ?? 20),
+  /** When set, API requests must carry this value in X-Origin-Verify (added by CloudFront), so the server cannot be called directly. */
+  originSecret: process.env.ORIGIN_SECRET ?? '',
 };
 
 export const SESSION_HOURS = 8;

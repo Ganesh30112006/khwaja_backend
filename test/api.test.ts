@@ -1,4 +1,7 @@
+import request from 'supertest';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { createApp } from '../src/app.js';
+import { config } from '../src/config.js';
 import { pool } from '../src/db/pool.js';
 import { BLO_MOBILE, C1_MOBILE, C2_MOBILE, call, expectStatus, login, PASSWORD, resetDb, SUPER_MOBILE } from './helpers.js';
 
@@ -505,5 +508,25 @@ describe('wards, reports and audit', () => {
     expect(bad.status).toBe(400);
     expect(bad.body.code).toBe('VALIDATION');
     expect((await expectStatus(call('get', '/health', null), 200)).ok).toBe(true);
+  });
+
+  it('compresses large responses for clients that accept gzip', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const res = await call('get', '/voters/export', sa).set('Accept-Encoding', 'gzip');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-encoding']).toBe('gzip');
+  });
+
+  it('with ORIGIN_SECRET set, only requests carrying it (from CloudFront) reach the API', async () => {
+    config.originSecret = 'from-cloudfront';
+    try {
+      const guarded = createApp();
+      expect((await request(guarded).get('/api/auth/me')).status).toBe(403);
+      expect((await request(guarded).get('/api/auth/me').set('X-Origin-Verify', 'wrong')).status).toBe(403);
+      expect((await request(guarded).get('/api/auth/me').set('X-Origin-Verify', 'from-cloudfront')).status).toBe(401);
+      expect((await request(guarded).get('/api/health')).status).toBe(200);
+    } finally {
+      config.originSecret = '';
+    }
   });
 });
