@@ -1,13 +1,8 @@
 # CI on every push and pull request: type check, API tests against a real PostgreSQL, build.
-# CD on main: package for Elastic Beanstalk and deploy (only once the AWS repository variables are set).
+# CD on main: package for Elastic Beanstalk and deploy to the Mumbai environment.
 #
-# Repository variables (Settings > Secrets and variables > Actions > Variables):
-#   AWS_ROLE_ARN     IAM role GitHub assumes through OIDC (no AWS keys stored in GitHub)
-#   AWS_REGION       e.g. ap-south-1
-#   EB_APP           Elastic Beanstalk application name
-#   EB_ENV           Elastic Beanstalk environment name
-#   EB_BUCKET        S3 bucket for application versions
-#   API_HEALTH_URL   e.g. https://dxxxx.cloudfront.net/api/health (checked after the deploy)
+# AWS access is through GitHub OIDC (no AWS keys stored in GitHub): the role trusts only this repo's
+# "production" environment. The values below are not secrets; repository variables of the same name override them.
 name: CI/CD
 
 on:
@@ -27,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm ci
       - run: npm run typecheck
@@ -36,7 +31,7 @@ jobs:
 
   deploy:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.AWS_ROLE_ARN != ''
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
@@ -48,15 +43,17 @@ jobs:
       contents: read
       id-token: write
     env:
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      EB_APP: ${{ vars.EB_APP }}
-      EB_ENV: ${{ vars.EB_ENV }}
-      EB_BUCKET: ${{ vars.EB_BUCKET }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN || 'arn:aws:iam::492462083767:role/voterdesk-backend-deploy' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+      EB_APP: ${{ vars.EB_APP || 'voter-desk' }}
+      EB_ENV: ${{ vars.EB_ENV || 'voter-desk-api' }}
+      EB_BUCKET: ${{ vars.EB_BUCKET || 'elasticbeanstalk-ap-south-1-492462083767' }}
+      API_HEALTH_URL: ${{ vars.API_HEALTH_URL || 'https://d37boaln3snj1u.cloudfront.net/api/health' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - name: Build and package
         run: |
@@ -67,8 +64,8 @@ jobs:
           zip -qr voter-desk-backend.zip dist migrations certs .ebextensions package.json package-lock.json
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
       - name: Deploy to Elastic Beanstalk
         run: |
           VERSION="${GITHUB_SHA::12}-${GITHUB_RUN_ATTEMPT}"
@@ -93,10 +90,9 @@ jobs:
           test "$DEPLOYED" = "$VERSION"
           test "$HEALTH" != "Red"
       - name: Check the API through CloudFront
-        if: vars.API_HEALTH_URL != ''
         run: |
           for i in $(seq 1 10); do
-            curl -fsS "${{ vars.API_HEALTH_URL }}" && exit 0
+            curl -fsS "$API_HEALTH_URL" && exit 0
             sleep 10
           done
           echo "Health check failed"; exit 1

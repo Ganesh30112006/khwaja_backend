@@ -3,7 +3,7 @@ import { expect } from 'vitest';
 import { createApp } from '../src/app.js';
 import { migrate } from '../src/db/migrate.js';
 import { pool, withTransaction } from '../src/db/pool.js';
-import { seedDemo } from '../src/db/seed.js';
+import { seedDemo } from './fixtures.js';
 
 export const PASSWORD = 'test-pass-1';
 export const SUPER_MOBILE = '9000000001';

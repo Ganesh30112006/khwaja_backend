@@ -16,7 +16,6 @@
     "migrate:prod": "node dist/scripts/migrate.js",
     "create-super-admin": "tsx src/scripts/createSuperAdmin.ts",
     "create-super-admin:prod": "node dist/scripts/createSuperAdmin.js",
-    "seed:demo": "tsx src/scripts/seedDemo.ts",
     "db:local": "tsx src/scripts/localDb.ts"
   },
   "dependencies": {

@@ -1,11 +1,8 @@
 import type pg from 'pg';
-import { hashPassword } from '../lib/password.js';
-import { pad } from '../lib/validation.js';
+import { hashPassword } from '../src/lib/password.js';
+import { pad } from '../src/lib/validation.js';
 
-/**
- * Demo data, generated exactly like the frontend's mock seed (Frontend/src/mocks/db.ts) so the
- * same voters, accounts and payments exist in both. Development and tests only.
- */
+/** Sample wards, accounts, voters and payments for the automated tests (never loaded into a real database). */
 
 function mulberry32(seed: number) {
   return () => {

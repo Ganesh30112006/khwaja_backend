@@ -2,7 +2,7 @@
 
 REST backend for the Voter Desk frontend: Node.js + TypeScript (Express 5) and PostgreSQL.
 Every business rule is enforced here: roles (Super Admin → Corporator → BLO; Super Admins can add Super Admins), ward/booth scope, one successful
-payment per voter, audit logging and the rest. The frontend's `src/mocks/mockServer.ts` mirrors the same rules.
+payment per voter, audit logging and the rest.
 
 ## Run it locally (no Docker)
 
@@ -11,22 +11,18 @@ cd Backend
 npm install
 cp .env.example .env          # already points at the local database below
 npm run db:local              # terminal 1: real PostgreSQL from npm, data in Backend/.pgdata
-npm run seed:demo             # once: the same demo data as the frontend mock (password demo@123)
+SUPER_ADMIN_NAME="Super Admin" SUPER_ADMIN_MOBILE=9xxxxxxxxx SUPER_ADMIN_PASSWORD=... npm run create-super-admin   # once
 npm run dev                   # terminal 2: API on http://localhost:4000/api (PORT in .env)
 ```
 
-Point the frontend at it: in `Frontend/.env.development` set `VITE_USE_MOCK=false` and
-`VITE_API_BASE_URL=http://localhost:4000/api`, then `npm run dev` in `Frontend/`.
-
-Demo logins (password `demo@123`; mobile number **or** full name):
-Super Admin `9000000001` / "Super Administrator" · Corporator C-1 `9876543210` / "Ramesh Babu" ·
-BLO C-1-BLO1 `9876543211` / "Lakshmi Prasad".
+Then run the frontend: `npm run dev` in `Frontend/` (its `.env.development` points at http://localhost:4000/api).
+Sign in with the Super Admin you created; add wards, accounts and voters (or import them) from the app.
 
 ## Checks
 
 ```bash
 npm run typecheck
-npm test        # starts its own throwaway PostgreSQL; 41 API tests
+npm test        # starts its own throwaway PostgreSQL; 43 API tests
 npm run build
 ```
 
@@ -63,4 +59,4 @@ See `.env.example`. Required: `DATABASE_URL`. Production on RDS also uses `DATAB
 - `src/services/*`: shared voter and payment logic
 - `src/lib/*`: validation, passwords (scrypt), scope rules, audit, IDs
 - `migrations/*.sql`: schema; applied in order on start (`schema_migrations` records what ran)
-- `src/db/seed.ts`: demo data identical to the frontend mock (development and tests only)
+- `test/fixtures.ts`: sample wards, accounts and voters used only by the automated tests

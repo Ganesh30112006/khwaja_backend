@@ -8,6 +8,8 @@ Set-Location $backend
 
 npm ci
 if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+# Start from an empty dist so files removed from src are not shipped.
+if (Test-Path dist) { Remove-Item -Recurse -Force dist }
 npm run build
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 
