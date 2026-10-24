@@ -1,4 +1,4 @@
-export type ApiErrorCode = 'SESSION_EXPIRED' | 'INVALID_CREDENTIALS' | 'FORBIDDEN' | 'NOT_FOUND' | 'VALIDATION' | 'CONFLICT';
+export type ApiErrorCode = 'SESSION_EXPIRED' | 'INVALID_CREDENTIALS' | 'FORBIDDEN' | 'NOT_FOUND' | 'VALIDATION' | 'CONFLICT' | 'WARD_TAKEN';
 
 /** An error that is sent to the client as { message, code, fieldErrors }. */
 export class ApiError extends Error {

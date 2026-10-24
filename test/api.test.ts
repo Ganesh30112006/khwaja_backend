@@ -11,7 +11,6 @@ interface VoterRow {
   recordId: string;
   voterId: string;
   fullName: string;
-  mobile: string;
   wardId: string;
   boothId: string;
   householdId: string;
@@ -26,7 +25,8 @@ async function voters(token: string, query: Record<string, unknown> = {}): Promi
 
 /** A voter (visible to this account) who has not received a payment yet. */
 async function notReceivedVoter(token: string, query: Record<string, unknown> = {}): Promise<VoterRow> {
-  return (await voters(token, { paymentStatus: 'Not Received', ...query }))[0];
+  // Only Active voters can be paid.
+  return (await voters(token, { paymentStatus: 'Not Received', status: 'Active', ...query }))[0];
 }
 
 const pay = (voterRecordId: string, idempotencyKey: string) => ({ voterRecordId, amount: 2000, receiverName: 'Ravi', receiverMobile: '9123412345', idempotencyKey });
@@ -76,7 +76,7 @@ describe('authentication', () => {
 
   it('same names are told apart by password, and a name + password pair cannot repeat', async () => {
     const sa = await login(SUPER_MOBILE);
-    const base = { fullName: 'Ravi Kumar', wardIds: ['W1'], boothIds: [], role: 'CORPORATOR' };
+    const base = { fullName: 'Ravi Kumar', wardIds: ['W1'], boothIds: [], role: 'CORPORATOR', moveWards: true };
     const first = await expectStatus(call('post', '/admins', sa, { ...base, mobile: '9988776601', password: 'firstPass1' }), 201);
     const second = await expectStatus(call('post', '/admins', sa, { ...base, mobile: '9988776602', password: 'secondPass2' }), 201);
     expect((await expectStatus(call('post', '/auth/login', null, { identifier: 'Ravi Kumar', password: 'firstPass1' }), 200)).admin.id).toBe(first.id);
@@ -110,7 +110,7 @@ describe('payments', () => {
     expect(new Date(tx.timestamp).getTime()).toBeGreaterThanOrEqual(before - 1000);
     expect(tx.statusReason).toBeUndefined();
     const detail = await expectStatus(call('get', `/voters/${voter.recordId}`, token), 200);
-    expect(detail.voter).toMatchObject({ paymentStatus: 'Received', canRecordPayment: false, fullName: voter.fullName, mobile: voter.mobile, status: voter.status });
+    expect(detail.voter).toMatchObject({ paymentStatus: 'Received', canRecordPayment: false, fullName: voter.fullName, status: voter.status });
     expect(detail.voter.latestPayment.receiverName).toBe('Someone Else');
     expect(detail.transactions).toHaveLength(1);
   });
@@ -137,7 +137,7 @@ describe('payments', () => {
 
   it('one person may receive for every member of a household', async () => {
     const sa = await login(SUPER_MOBILE);
-    const list = await voters(sa, { paymentStatus: 'Not Received' });
+    const list = await voters(sa, { paymentStatus: 'Not Received', status: 'Active' });
     const byHousehold = new Map<string, VoterRow[]>();
     for (const v of list) byHousehold.set(v.householdId, [...(byHousehold.get(v.householdId) ?? []), v]);
     const members = [...byHousehold.values()].find((m) => m.length >= 2)!;
@@ -190,10 +190,50 @@ describe('payments', () => {
     expect(detail.audit.map((a: { action: string }) => a.action)).toEqual(['Payment cancelled', 'Payment recorded']);
   });
 
-  it('only the Super Admin can cancel a payment', async () => {
-    const c1 = await login(C1_MOBILE);
-    const tx = await expectStatus(call('post', '/payments', c1, pay((await notReceivedVoter(c1)).recordId, 'cx')), 201);
-    await expectStatus(call('post', `/payments/${tx.id}/cancel`, c1, { kind: 'Cancelled', reason: 'Mistake' }), 403);
+  it('Corporators and BLOs are never shown a Super Admin account', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const target = await notReceivedVoter(sa, { boothId: 'B1-1' });
+    const tx = await expectStatus(call('post', '/payments', sa, pay(target.recordId, 'sa-pay')), 201);
+    for (const token of [await login(C1_MOBILE), await login(BLO_MOBILE)]) {
+      const list = await expectStatus(call('get', '/payments', token, undefined, { pageSize: 100 }), 200);
+      expect(list.items.find((t: { id: string }) => t.id === tx.id)).toMatchObject({ adminId: '', adminName: '' });
+      const detail = await expectStatus(call('get', `/payments/${tx.id}`, token), 200);
+      expect(JSON.stringify(detail)).not.toMatch(/SA-1|Super Admin/);
+      const voter = await expectStatus(call('get', `/voters/${target.recordId}`, token), 200);
+      expect(JSON.stringify(voter)).not.toMatch(/SA-1|Super Admin/);
+    }
+    expect((await expectStatus(call('get', `/payments/${tx.id}`, sa), 200)).transaction.adminId).toBe('SA-1');
+  });
+
+  it('a Corporator can cancel payments in its wards; BLOs and other Corporators cannot', async () => {
+    const blo = await login(BLO_MOBILE);
+    const tx = await expectStatus(call('post', '/payments', blo, pay((await notReceivedVoter(blo)).recordId, 'cx')), 201);
+    await expectStatus(call('post', `/payments/${tx.id}/cancel`, blo, { kind: 'Cancelled', reason: 'Mistake' }), 403);
+    await expectStatus(call('post', `/payments/${tx.id}/cancel`, await login(C2_MOBILE), { kind: 'Cancelled', reason: 'Mistake' }), 404);
+    const cancelled = await expectStatus(call('post', `/payments/${tx.id}/cancel`, await login(C1_MOBILE), { kind: 'Cancelled', reason: 'Mistake' }), 200);
+    expect(cancelled.status).toBe('Cancelled');
+  });
+
+  it('only Active voters can be paid; a deaths / shifted list updates statuses in bulk', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const [a, b] = await voters(sa, { paymentStatus: 'Not Received', status: 'Active', wardId: 'W1', pageSize: 2 });
+    const res = await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId.toLowerCase(), b.voterId, 'NOPE123'], status: 'Shifted', fileName: 'shifted.pdf' }), 200);
+    expect(res).toEqual({ updated: 2, unchanged: 0, notFound: ['NOPE123'], outsideArea: [] });
+    const again = await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Shifted' }), 200);
+    expect(again).toMatchObject({ updated: 0, unchanged: 1 });
+    const detail = await expectStatus(call('get', `/voters/${a.recordId}`, sa), 200);
+    expect(detail.voter).toMatchObject({ status: 'Shifted', canRecordPayment: false });
+    const refused = await expectStatus(call('post', '/payments', sa, pay(a.recordId, 'shifted-pay')), 409);
+    expect(refused.message).toContain('Shifted');
+    await expectStatus(call('post', '/voters/status', sa, { voterIds: [b.voterId], status: 'Not Active' }), 200);
+    await expectStatus(call('post', '/payments', sa, pay(b.recordId, 'deceased-pay')), 409);
+    await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Gone' }), 400);
+    // C-2 covers ward 3 only: a voter in ward 1 is reported, not changed. BLOs cannot do this at all.
+    const c2 = await expectStatus(call('post', '/voters/status', await login(C2_MOBILE), { voterIds: [a.voterId], status: 'Active' }), 200);
+    expect(c2).toMatchObject({ updated: 0, outsideArea: [a.voterId.toUpperCase()] });
+    await expectStatus(call('post', '/voters/status', await login(BLO_MOBILE), { voterIds: [a.voterId], status: 'Active' }), 403);
+    const audit = await expectStatus(call('get', '/audit-logs', sa, undefined, { recordRef: 'shifted.pdf' }), 200);
+    expect(audit.items[0].summary).toBe('2 voters → Shifted (from shifted.pdf)');
   });
 
   it('validates the amount and receiver, and enforces a fixed amount', async () => {
@@ -237,8 +277,10 @@ describe('Corporators and BLOs', () => {
 
   it('generates C-n IDs for Corporators and C-n-BLOm IDs for BLOs, and they can sign in', async () => {
     const sa = await login(SUPER_MOBILE);
-    expect((await expectStatus(call('post', '/admins', sa, corporator), 201)).id).toBe('C-5');
-    expect((await expectStatus(call('post', '/admins', sa, { ...corporator, fullName: 'Second Corporator', mobile: '9988776656' }), 201)).id).toBe('C-6');
+    const w6 = (await expectStatus(call('post', '/wards', sa, { number: 6, name: 'Six' }), 201)).id;
+    const w7 = (await expectStatus(call('post', '/wards', sa, { number: 7, name: 'Seven' }), 201)).id;
+    expect((await expectStatus(call('post', '/admins', sa, { ...corporator, wardIds: [w6] }), 201)).id).toBe('C-5');
+    expect((await expectStatus(call('post', '/admins', sa, { ...corporator, wardIds: [w7], fullName: 'Second Corporator', mobile: '9988776656' }), 201)).id).toBe('C-6');
     const blo = await expectStatus(call('post', '/admins', sa, { ...corporator, fullName: 'New BLO', role: 'BLO', corporatorId: 'C-1', mobile: '9988776657', boothIds: ['B1-3'] }), 201);
     expect(blo).toMatchObject({ id: 'C-1-BLO3', corporatorId: 'C-1', boothIds: ['B1-3'], location: '' });
     expect((await expectStatus(call('post', '/auth/login', null, { identifier: '9988776655', password: 'secret123' }), 200)).admin.id).toBe('C-5');
@@ -263,7 +305,7 @@ describe('Corporators and BLOs', () => {
 
   it('stores a location for Corporators only and audits changes', async () => {
     const sa = await login(SUPER_MOBILE);
-    const created = await expectStatus(call('post', '/admins', sa, { ...corporator, location: '  Gandhi Nagar office  ' }), 201);
+    const created = await expectStatus(call('post', '/admins', sa, { ...corporator, moveWards: true, location: '  Gandhi Nagar office  ' }), 201);
     expect(created.location).toBe('Gandhi Nagar office');
     const blo = await expectStatus(call('post', '/admins', sa, { ...corporator, fullName: 'Another Person', role: 'BLO', corporatorId: created.id, mobile: '9988776650', location: 'ignored' }), 201);
     expect(blo.location).toBe('');
@@ -340,18 +382,50 @@ describe('Corporators and BLOs', () => {
     await login(BLO_MOBILE, 'mynewpass1');
   });
 
-  it('Corporators and BLOs cannot use Super Admin endpoints', async () => {
+  it('Corporators and BLOs cannot use Super Admin endpoints; BLOs cannot manage wards or voters', async () => {
     for (const token of [await login(C2_MOBILE), await login(BLO_MOBILE)]) {
       await expectStatus(call('get', '/audit-logs', token), 403);
       await expectStatus(call('get', '/settings/payment', token), 403);
-      await expectStatus(call('get', '/wards/summary', token), 403);
       await expectStatus(call('post', '/wards', token, { number: 9, name: 'Nine' }), 403);
-      await expectStatus(call('get', '/imports/context', token), 403);
-      await expectStatus(call('get', '/voters/export', token), 403);
-      const voter = await notReceivedVoter(token);
-      await expectStatus(call('put', `/voters/${voter.recordId}`, token, voter), 403);
+      await expectStatus(call('put', '/wards/W3/admins', token, { adminIds: [] }), 403);
     }
-    await expectStatus(call('get', '/admins', await login(BLO_MOBILE)), 403);
+    const blo = await login(BLO_MOBILE);
+    await expectStatus(call('get', '/wards/summary', blo), 403);
+    await expectStatus(call('get', '/imports/context', blo), 403);
+    await expectStatus(call('get', '/voters/export', blo), 403);
+    const voter = await notReceivedVoter(blo);
+    await expectStatus(call('put', `/voters/${voter.recordId}`, blo, voter), 403);
+    await expectStatus(call('get', '/admins', blo), 403);
+  });
+
+  it('a Corporator has full control inside its own wards only', async () => {
+    const c2 = await login(C2_MOBILE); // ward W3
+    const summary = await expectStatus(call('get', '/wards/summary', c2), 200);
+    expect(summary.map((w: { id: string }) => w.id)).toEqual(['W3']);
+    const voter = { voterId: 'C2NEW1', fullName: 'Ward Three Voter', wardId: 'W3', boothId: '', houseNumber: '3-1', householdId: '', address: '', status: 'Active' };
+    const created = await expectStatus(call('post', '/voters', c2, voter), 201);
+    await expectStatus(call('post', '/voters', c2, { ...voter, voterId: 'C2NEW2', wardId: 'W1' }), 403);
+    await expectStatus(call('put', `/voters/${created.recordId}`, c2, { ...voter, wardId: 'W1' }), 403);
+    expect((await expectStatus(call('put', `/voters/${created.recordId}`, c2, { ...voter, fullName: 'Renamed' }), 200)).fullName).toBe('Renamed');
+    const w1Voter = (await voters(await login(SUPER_MOBILE), { wardId: 'W1', pageSize: 1 }))[0];
+    await expectStatus(call('put', `/voters/${w1Voter.recordId}`, c2, { ...w1Voter, wardId: 'W3' }), 404);
+    const booth = await expectStatus(call('post', '/booths', c2, { wardId: 'W3', number: 39, name: 'New booth' }), 201);
+    await expectStatus(call('post', '/booths', c2, { wardId: 'W1', number: 19, name: 'Not mine' }), 403);
+    await expectStatus(call('put', `/booths/${booth.id}/admins`, c2, { adminIds: ['C-2-BLO1'] }), 204);
+    await expectStatus(call('put', '/booths/B1-1/admins', c2, { adminIds: ['C-2-BLO1'] }), 404);
+  });
+
+  it('a ward has one Corporator: assigning a taken ward asks to move it', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const input = { ...corporator, wardIds: ['W3'] };
+    const taken = await expectStatus(call('post', '/admins', sa, input), 409);
+    expect(taken).toMatchObject({ code: 'WARD_TAKEN', message: 'Ward 3 is already assigned to C-2 (Sunitha Devi).' });
+    const moved = await expectStatus(call('post', '/admins', sa, { ...input, moveWards: true }), 201);
+    expect(moved.wardIds).toEqual(['W3']);
+    expect((await expectStatus(call('get', '/admins/C-2', sa), 200)).wardIds).toEqual([]);
+    // C-2's BLO lost ward 3 with it.
+    expect((await expectStatus(call('get', '/admins/C-2-BLO1', sa), 200)).wardIds).toEqual([]);
+    await expectStatus(call('put', '/wards/W4/admins', sa, { adminIds: ['C-1', 'C-3'] }), 400);
   });
 
   it('deactivating an account ends its sessions', async () => {
@@ -364,7 +438,7 @@ describe('Corporators and BLOs', () => {
 });
 
 describe('voters', () => {
-  const base = { fullName: 'Test Voter', mobile: '', wardId: 'W1', boothId: 'B1-1', houseNumber: '1', householdId: '', address: '', status: 'Active' };
+  const base = { fullName: 'Test Voter', wardId: 'W1', boothId: 'B1-1', houseNumber: '1', householdId: '', address: '', status: 'Active' };
 
   it('rejects a duplicate voter ID (any case), keeps leading zeros and requires a booth in the ward', async () => {
     const sa = await login(SUPER_MOBILE);
@@ -373,6 +447,32 @@ describe('voters', () => {
     expect((await expectStatus(call('post', '/voters', sa, { ...base, voterId: 'NEW1', boothId: 'B2-1' }), 400)).fieldErrors.boothId).toBeDefined();
     const created = await expectStatus(call('post', '/voters', sa, { ...base, voterId: '000NEW' }), 201);
     expect(created).toMatchObject({ voterId: '000NEW', recordId: expect.stringMatching(/^VR-\d{6}$/) });
+  });
+
+  it('a voter may have no booth: whole-ward accounts cover it, booth-limited BLOs do not; no voter mobile', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const created = await expectStatus(call('post', '/voters', sa, { ...base, voterId: 'NOBOOTH1', boothId: '', mobile: '9999999999' }), 201);
+    expect(created).toMatchObject({ voterId: 'NOBOOTH1', wardId: 'W1', boothId: '' });
+    expect(created).not.toHaveProperty('mobile');
+    const audit = await expectStatus(call('get', '/audit-logs', sa, undefined, { recordRef: 'NOBOOTH1' }), 200);
+    expect(audit.items[0].summary).toContain('ward 1, no booth');
+    // C-1 covers all of ward 1; C-1-BLO1 only booths B1-1 and B1-2.
+    const c1 = await login(C1_MOBILE);
+    expect((await voters(c1, { search: 'NOBOOTH1' })).map((v) => v.voterId)).toEqual(['NOBOOTH1']);
+    expect(await voters(await login(BLO_MOBILE), { search: 'NOBOOTH1' })).toEqual([]);
+    const payment = await expectStatus(call('post', '/payments', c1, pay(created.recordId, 'nobooth')), 201);
+    expect(payment.boothId).toBe('');
+    const report = await expectStatus(call('get', '/reports', sa, undefined, { wardId: 'W1' }), 200);
+    expect(report.byBooth.find((b: { key: string }) => b.key === '')).toMatchObject({ label: 'No booth', voters: 1, received: 1 });
+  });
+
+  it('stores optional age and gender as printed on the roll', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const created = await expectStatus(call('post', '/voters', sa, { ...base, voterId: 'AGE1', age: 44, gender: 'Female' }), 201);
+    expect(created).toMatchObject({ age: 44, gender: 'Female' });
+    expect(await expectStatus(call('post', '/voters', sa, { ...base, voterId: 'AGE2' }), 201)).toMatchObject({ age: null, gender: '' });
+    const bad = await expectStatus(call('post', '/voters', sa, { ...base, voterId: 'AGE3', age: 7, gender: 'X' }), 400);
+    expect(Object.keys(bad.fieldErrors).sort()).toEqual(['age', 'gender']);
   });
 
   it('never defaults the status and keeps a household inside one ward', async () => {
@@ -401,9 +501,9 @@ describe('voters', () => {
     expect(bloVoters.every((v) => ['B1-1', 'B1-2'].includes(v.boothId))).toBe(true);
     const sa = await login(SUPER_MOBILE);
     const all = await voters(sa);
-    const target = all.find((v) => v.mobile)!;
+    const target = all[0];
     expect((await voters(sa, { search: target.voterId.toLowerCase() })).map((v) => v.recordId)).toEqual([target.recordId]);
-    expect((await voters(sa, { search: target.mobile.slice(2, 8) })).some((v) => v.recordId === target.recordId)).toBe(true);
+    expect((await voters(sa, { search: target.houseNumber })).some((v) => v.recordId === target.recordId)).toBe(true);
     const page = await expectStatus(call('get', '/voters', sa, undefined, { page: 999, pageSize: 10 }), 200);
     expect(page.page).toBe(Math.ceil(page.total / 10));
     const byName = await voters(sa, { sortBy: 'fullName', sortDir: 'desc' });
@@ -437,7 +537,7 @@ describe('imports', () => {
     const ctx = await expectStatus(call('get', '/imports/context', sa), 200);
     expect(ctx.existingVoterIds.length).toBeGreaterThan(0);
     const { importId } = await expectStatus(call('post', '/imports', sa, { fileName: 'voters.xlsx' }), 201);
-    const voter = (id: string, extra = {}) => ({ voterId: id, fullName: 'Imported Person', mobile: '', wardId: 'W2', boothId: 'B2-1', houseNumber: '9', householdId: '', address: '', status: 'Active', ...extra });
+    const voter = (id: string, extra = {}) => ({ voterId: id, fullName: 'Imported Person', wardId: 'W2', boothId: 'B2-1', houseNumber: '9', householdId: '', address: '', status: 'Active', ...extra });
     const batch = await expectStatus(call('post', `/imports/${importId}/rows`, sa, { rows: [
       { rowNumber: 2, voter: voter('IMP0001') },
       { rowNumber: 3, voter: voter(ctx.existingVoterIds[0]) },
@@ -449,7 +549,25 @@ describe('imports', () => {
     expect(done).toMatchObject({ imported: 1, skipped: 5, failed: 1 });
     expect(done.errors.map((e: { rowNumber: number }) => e.rowNumber).sort()).toEqual([3, 4, 5]);
     await expectStatus(call('post', `/imports/${importId}/complete`, sa, {}), 404);
-    expect((await pool.query(`SELECT summary FROM audit_logs WHERE entity = 'Import'`)).rows).toEqual([{ summary: '1 imported, 5 skipped, 1 failed' }]);
+    expect((await pool.query(`SELECT summary FROM audit_logs WHERE entity = 'Import'`)).rows).toEqual([{ summary: '1 imported, 0 replaced, 5 skipped, 1 failed' }]);
+  });
+});
+
+describe('imports: existing voters', () => {
+  it('replaces an existing voter only when asked, and a Corporator only inside its wards', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const existing = (await voters(sa, { wardId: 'W3', pageSize: 1 }))[0];
+    const row = { voterId: existing.voterId.toLowerCase(), fullName: 'Replaced Name', wardId: 'W3', boothId: '', houseNumber: '7-7', householdId: '', address: '', status: 'Active' };
+    const run = async (token: string, replace: boolean) => {
+      const { importId } = await expectStatus(call('post', '/imports', token, { fileName: 'roll.pdf' }), 201);
+      return expectStatus(call('post', `/imports/${importId}/rows`, token, { rows: [{ rowNumber: 1, voter: row, replace }] }), 200);
+    };
+    expect(await run(sa, false)).toMatchObject({ imported: 0, replaced: 0, skipped: 1 });
+    expect((await expectStatus(call('get', `/voters/${existing.recordId}`, sa), 200)).voter.fullName).toBe(existing.fullName);
+    expect(await run(await login(C1_MOBILE), true)).toMatchObject({ replaced: 0, failed: 1 }); // ward 3 is C-2's
+    expect(await run(await login(C2_MOBILE), true)).toMatchObject({ replaced: 1, failed: 0 });
+    const after = (await expectStatus(call('get', `/voters/${existing.recordId}`, sa), 200)).voter;
+    expect(after).toMatchObject({ recordId: existing.recordId, voterId: row.voterId, fullName: 'Replaced Name', houseNumber: '7-7' });
   });
 });
 
@@ -498,7 +616,7 @@ describe('wards, reports and audit', () => {
     const target = await notReceivedVoter(sa, { boothId: 'B1-1' });
     await expectStatus(call('post', '/payments', sa, pay(target.recordId, 'n1')), 201);
     const notes = await expectStatus(call('get', '/notifications', await login(BLO_MOBILE)), 200);
-    expect(notes[0]).toMatchObject({ title: 'Payment recorded by SA-1' });
+    expect(notes[0]).toMatchObject({ title: 'Payment recorded' });
     expect(notes[0].body).toContain(target.voterId);
   });
 

@@ -1,4 +1,5 @@
 import type { Db } from '../db/pool.js';
+import { fail } from './errors.js';
 
 export type Role = 'SUPER_ADMIN' | 'CORPORATOR' | 'BLO';
 /** Roles an account can be created with (a Super Admin can create any role, a Corporator only BLOs). */
@@ -46,6 +47,15 @@ export function manages(actor: Admin, target: Pick<Admin, 'id' | 'role' | 'corpo
   if (actor.role === 'SUPER_ADMIN') return target.id !== actor.id;
   if (target.role === 'SUPER_ADMIN') return false;
   return actor.role === 'CORPORATOR' && target.role === 'BLO' && target.corporatorId === actor.id;
+}
+
+/** A Corporator may only act inside its own wards; the Super Admin anywhere. */
+export function ownsWard(actor: Admin, wardId: string): boolean {
+  return actor.role === 'SUPER_ADMIN' || (actor.role === 'CORPORATOR' && actor.wardIds.includes(wardId));
+}
+
+export function assertOwnWard(actor: Admin, wardId: string): void {
+  if (!ownsWard(actor, wardId)) fail(403, 'FORBIDDEN', 'This ward is not assigned to you.');
 }
 
 /**

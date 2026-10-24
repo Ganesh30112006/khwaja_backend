@@ -4,17 +4,20 @@ import { pool, withTransaction } from '../db/pool.js';
 import { addAudit } from '../lib/audit.js';
 import { ApiError, fail } from '../lib/errors.js';
 import { str } from '../lib/validation.js';
-import { auth, authenticate, requireSuper } from '../middleware/auth.js';
-import { insertVoter, loadLocationRefs, validateVoterInput } from '../services/voters.js';
+import { auth, authenticate, requireWardManager } from '../middleware/auth.js';
+import { ownsWard } from '../lib/admins.js';
+import { findVoterByVoterId, insertVoter, loadLocationRefs, updateVoter, validateVoterInput } from '../services/voters.js';
 
 export const importsRouter = Router();
-importsRouter.use('/imports', authenticate, requireSuper);
+importsRouter.use('/imports', authenticate, requireWardManager);
 
 const MAX_BATCH_ROWS = 500;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface ImportResult {
   imported: number;
+  /** Existing voters whose details were replaced by the file (when the user chose "replace"). */
+  replaced: number;
   skipped: number;
   failed: number;
   errors: { rowNumber: number; message: string }[];
@@ -51,23 +54,39 @@ async function findJob(id: string, adminId: string, message: string) {
   return job;
 }
 
-/** Re-validates and inserts each row on its own: a duplicate Voter ID is skipped, any other problem fails that row. */
+/**
+ * Re-validates and saves each row on its own. A row whose Voter ID already exists is skipped, unless the user chose
+ * to replace existing voters (`replace: true`): then that voter's details are overwritten (payments stay with it).
+ * Corporators can only import into, and replace voters in, their own wards. Any other problem fails that row.
+ */
 importsRouter.post('/imports/:id/rows', async (req, res) => {
   const { admin } = auth(req);
   await findJob(str(req.params.id), admin.id, 'Import session not found. Start the import again.');
+  const wardNumbers = new Map((await pool.query<{ id: string; number: number }>('SELECT id, number FROM wards')).rows.map((w) => [w.id, w.number]));
   const rows: unknown[] = Array.isArray(req.body?.rows) ? req.body.rows : [];
   if (rows.length > MAX_BATCH_ROWS) fail(400, 'VALIDATION', `Send at most ${MAX_BATCH_ROWS} rows per batch.`);
   const refs = await loadLocationRefs(pool);
-  const result: ImportResult = { imported: 0, skipped: 0, failed: 0, errors: [] };
+  const result: ImportResult = { imported: 0, replaced: 0, skipped: 0, failed: 0, errors: [] };
   for (const raw of rows) {
-    const row = (raw ?? {}) as { rowNumber?: unknown; voter?: unknown };
+    const row = (raw ?? {}) as { rowNumber?: unknown; voter?: unknown; replace?: unknown };
     const rowNumber = Number.isInteger(row.rowNumber) ? (row.rowNumber as number) : 0;
+    const body = (row.voter ?? {}) as Record<string, unknown>;
     try {
-      await withTransaction(async (db) => {
-        const input = await validateVoterInput(db, refs, (row.voter ?? {}) as Record<string, unknown>);
+      const outcome = await withTransaction(async (db) => {
+        const existing = row.replace === true ? await findVoterByVoterId(db, String(body.voterId ?? ''), true) : undefined;
+        if (existing && !ownsWard(admin, existing.wardId)) {
+          fail(403, 'FORBIDDEN', `This voter is in ward ${wardNumbers.get(existing.wardId) ?? '?'}, which is not assigned to you.`);
+        }
+        const input = await validateVoterInput(db, refs, body, existing?.recordId);
+        if (!ownsWard(admin, input.wardId)) fail(403, 'FORBIDDEN', `Ward ${wardNumbers.get(input.wardId) ?? '?'} is not assigned to you.`);
+        if (existing) {
+          await updateVoter(db, existing.recordId, input);
+          return 'replaced' as const;
+        }
         await insertVoter(db, input);
+        return 'imported' as const;
       });
-      result.imported++;
+      result[outcome]++;
     } catch (err) {
       if (!(err instanceof ApiError)) throw err;
       if (err.code === 'CONFLICT') result.skipped++;
@@ -76,8 +95,8 @@ importsRouter.post('/imports/:id/rows', async (req, res) => {
     }
   }
   await pool.query(
-    'UPDATE import_jobs SET imported = imported + $2, skipped = skipped + $3, failed = failed + $4, errors = errors || $5::jsonb WHERE id = $1',
-    [str(req.params.id), result.imported, result.skipped, result.failed, JSON.stringify(result.errors)],
+    'UPDATE import_jobs SET imported = imported + $2, replaced = replaced + $3, skipped = skipped + $4, failed = failed + $5, errors = errors || $6::jsonb WHERE id = $1',
+    [str(req.params.id), result.imported, result.replaced, result.skipped, result.failed, JSON.stringify(result.errors)],
   );
   res.json(result);
 });
@@ -87,21 +106,21 @@ importsRouter.post('/imports/:id/complete', async (req, res) => {
   const skippedBefore = Math.max(0, Math.floor(Number(req.body?.skippedBeforeUpload)) || 0);
   const total = await withTransaction(async (db) => {
     const job = UUID.test(str(req.params.id))
-      ? (await db.query<{ fileName: string; imported: number; skipped: number; failed: number; errors: ImportResult['errors'] }>(
-          'DELETE FROM import_jobs WHERE id = $1 AND admin_id = $2 RETURNING file_name AS "fileName", imported, skipped, failed, errors',
+      ? (await db.query<{ fileName: string; imported: number; replaced: number; skipped: number; failed: number; errors: ImportResult['errors'] }>(
+          'DELETE FROM import_jobs WHERE id = $1 AND admin_id = $2 RETURNING file_name AS "fileName", imported, replaced, skipped, failed, errors',
           [str(req.params.id), admin.id],
         )).rows[0]
       : undefined;
     if (!job) fail(404, 'NOT_FOUND', 'Import session not found.');
-    const result: ImportResult = { imported: job.imported, skipped: job.skipped + skippedBefore, failed: job.failed, errors: job.errors };
+    const result: ImportResult = { imported: job.imported, replaced: job.replaced, skipped: job.skipped + skippedBefore, failed: job.failed, errors: job.errors };
     await addAudit(
       db,
       admin,
       'Voters imported',
       'Import',
       job.fileName,
-      `${result.imported} imported, ${result.skipped} skipped, ${result.failed} failed`,
-      result.imported > 0 || result.failed === 0 ? 'Success' : 'Failure',
+      `${result.imported} imported, ${result.replaced} replaced, ${result.skipped} skipped, ${result.failed} failed`,
+      result.imported > 0 || result.replaced > 0 || result.failed === 0 ? 'Success' : 'Failure',
     );
     return result;
   });

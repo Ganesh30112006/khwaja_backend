@@ -7,7 +7,7 @@ import { pageWindow } from '../lib/pagination.js';
 import { addDays, sqlLocalDate, today } from '../lib/time.js';
 import { formatInr, isValidDate, likePattern, str } from '../lib/validation.js';
 import { auth, authenticate, requireSuper } from '../middleware/auth.js';
-import { cleanTxn, TXN_SELECT, type PaymentTransaction } from '../services/payments.js';
+import { TXN_SELECT, txnFor, type PaymentTransaction } from '../services/payments.js';
 
 export const reportsRouter = Router();
 
@@ -82,7 +82,7 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
     `WITH sv AS (SELECT v.record_id, v.ward_id, v.booth_id, v.status FROM voters v WHERE ${vw}),
           tx AS (SELECT t.voter_record_id, t.amount FROM payment_transactions t JOIN sv ON sv.record_id = t.voter_record_id WHERE ${tw}),
           vt AS (SELECT voter_record_id, count(*) AS n, sum(amount) AS amount FROM tx GROUP BY voter_record_id)
-     SELECT sv.ward_id AS "wardId", sv.booth_id AS "boothId", count(*)::int AS voters,
+     SELECT sv.ward_id AS "wardId", COALESCE(sv.booth_id, '') AS "boothId", count(*)::int AS voters,
        count(*) FILTER (WHERE sv.status = 'Active')::int AS active,
        count(*) FILTER (WHERE sv.status = 'Not Active')::int AS "notActive",
        count(*) FILTER (WHERE sv.status = 'Shifted')::int AS shifted,
@@ -110,7 +110,7 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
   }
   for (const c of cells) {
     const w = byWardMap.get(c.wardId) ?? empty(c.wardId, `Ward ${wardNo.get(c.wardId) ?? 0}`);
-    const b = byBoothMap.get(c.boothId) ?? empty(c.boothId, `Booth ${boothNo.get(c.boothId) ?? 0}`);
+    const b = byBoothMap.get(c.boothId) ?? empty(c.boothId, c.boothId ? `Booth ${boothNo.get(c.boothId) ?? 0}` : 'No booth');
     for (const r of [w, b]) {
       r.voters += c.voters;
       r.active += c.active;
@@ -183,7 +183,7 @@ reportsRouter.get('/reports/dashboard', authenticate, async (req, res) => {
   if (f.to) recentWhere.push(`${sqlLocalDate('t."timestamp"')} <= ${pr.add(f.to)}::date`);
   if (f.wardId) recentWhere.push(`t.ward_id = ${pr.add(f.wardId)}`);
   if (f.boothId) recentWhere.push(`t.booth_id = ${pr.add(f.boothId)}`);
-  const recentTransactions = (await pool.query<PaymentTransaction>(`${TXN_SELECT} WHERE ${recentWhere.join(' AND ')} ORDER BY t."timestamp" DESC, t.id DESC LIMIT 8`, pr.values)).rows.map(cleanTxn);
+  const recentTransactions = (await pool.query<PaymentTransaction>(`${TXN_SELECT} WHERE ${recentWhere.join(' AND ')} ORDER BY t."timestamp" DESC, t.id DESC LIMIT 8`, pr.values)).rows.map(txnFor(scope));
   const recentActivity = (await pool.query<AuditLog>(
     `SELECT ${AUDIT_COLUMNS} FROM audit_logs WHERE entity <> 'Auth' ${isSuper ? '' : 'AND admin_id = $1'} ORDER BY "timestamp" DESC, seq DESC LIMIT 8`,
     isSuper ? [] : [admin.id],
@@ -278,16 +278,17 @@ reportsRouter.get('/notifications', authenticate, async (req, res) => {
   const txs = (await pool.query<PaymentTransaction>(
     `${TXN_SELECT} WHERE t.admin_id <> ${p.add(admin.id)} AND ${coversSql(scope, (v) => p.add(v), 't.ward_id', 't.booth_id')} ORDER BY t."timestamp" DESC LIMIT 10`,
     p.values,
-  )).rows;
+  )).rows.map(txnFor(scope));
   const settings = (await pool.query<AuditLog>(`SELECT ${AUDIT_COLUMNS} FROM audit_logs WHERE entity = 'Settings' ORDER BY "timestamp" DESC, seq DESC LIMIT 10`)).rows;
   const items = [
     ...txs.map((t) => ({
       id: t.id,
-      title: t.status === 'Success' ? `Payment recorded by ${t.adminId}` : `Payment ${t.status.toLowerCase()}`,
+      title: t.status !== 'Success' ? `Payment ${t.status.toLowerCase()}` : t.adminId ? `Payment recorded by ${t.adminId}` : 'Payment recorded',
       body: `${t.voterName} (${t.voterId}) · ${formatInr(t.amount)}`,
       timestamp: t.timestamp,
     })),
-    ...settings.map((a) => ({ id: a.id, title: 'Payment settings updated', body: a.summary, timestamp: a.timestamp })),
+    // Field accounts only learn that the payment details changed, not who changed them.
+    ...settings.map((a) => ({ id: a.id, title: 'Payment details', body: 'Successfully updated', timestamp: a.timestamp })),
   ];
   items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   res.json(items.slice(0, 10));

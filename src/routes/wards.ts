@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { isUniqueViolation, pool, withTransaction, type Db } from '../db/pool.js';
+import { assertOwnWard, ownsWard } from '../lib/admins.js';
 import { addAudit } from '../lib/audit.js';
 import { fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
 import { str, strArray } from '../lib/validation.js';
-import { auth, authenticate, requireSuper } from '../middleware/auth.js';
+import { auth, authenticate, requireSuper, requireWardManager } from '../middleware/auth.js';
 import { trimBlosToCorporator } from './admins.js';
 
 export const wardsRouter = Router();
@@ -71,7 +72,9 @@ wardsRouter.get('/wards', authenticate, async (_req, res) => {
   res.json({ wards, booths });
 });
 
-wardsRouter.get('/wards/summary', authenticate, requireSuper, async (_req, res) => {
+/** Wards with their booths, voter counts and assigned accounts. A Corporator sees only its own wards. */
+wardsRouter.get('/wards/summary', authenticate, requireWardManager, async (req, res) => {
+  const actor = auth(req).admin;
   const wards = (await pool.query<Ward & { voterCount: number; adminIds: string[] }>(
     `SELECT w.id, w.number, w.name,
        (SELECT count(*) FROM voters v WHERE v.ward_id = w.id) AS "voterCount",
@@ -86,7 +89,7 @@ wardsRouter.get('/wards/summary', authenticate, requireSuper, async (_req, res) 
                  WHERE ab.booth_id = b.id AND a.role = 'BLO'), '{}') AS "adminIds"
      FROM booths b ORDER BY b.number, b.id`,
   )).rows;
-  res.json(wards.map((w) => ({ ...w, booths: booths.filter((b) => b.wardId === w.id) })));
+  res.json(wards.filter((w) => ownsWard(actor, w.id)).map((w) => ({ ...w, booths: booths.filter((b) => b.wardId === w.id) })));
 });
 
 wardsRouter.post('/wards', authenticate, requireSuper, async (req, res) => {
@@ -117,10 +120,11 @@ wardsRouter.put('/wards/:id', authenticate, requireSuper, async (req, res) => {
   res.json(ward);
 });
 
-wardsRouter.post('/booths', authenticate, requireSuper, async (req, res) => {
+wardsRouter.post('/booths', authenticate, requireWardManager, async (req, res) => {
   const actor = auth(req).admin;
   const booth = await withTransaction(async (db) => {
     const clean = await validateBooth(db, str(req.body?.wardId), req.body ?? {});
+    assertOwnWard(actor, clean.wardId);
     let id: string;
     do id = `B-${await nextNumber(db, 'booth')}`;
     while ((await db.query('SELECT 1 FROM booths WHERE id = $1', [id])).rowCount);
@@ -133,11 +137,11 @@ wardsRouter.post('/booths', authenticate, requireSuper, async (req, res) => {
   res.status(201).json(booth);
 });
 
-wardsRouter.put('/booths/:id', authenticate, requireSuper, async (req, res) => {
+wardsRouter.put('/booths/:id', authenticate, requireWardManager, async (req, res) => {
   const actor = auth(req).admin;
   const booth = await withTransaction(async (db) => {
     const current = (await db.query<Booth>(`SELECT ${BOOTH_COLUMNS} FROM booths WHERE id = $1 FOR UPDATE`, [str(req.params.id)])).rows[0];
-    if (!current) fail(404, 'NOT_FOUND', 'Booth not found.');
+    if (!current || !ownsWard(actor, current.wardId)) fail(404, 'NOT_FOUND', 'Booth not found.');
     // A booth stays in its ward so existing voter records remain consistent.
     const clean = await validateBooth(db, current.wardId, req.body ?? {}, current.id);
     await db
@@ -149,10 +153,14 @@ wardsRouter.put('/booths/:id', authenticate, requireSuper, async (req, res) => {
   res.json(booth);
 });
 
-/** Sets exactly which Corporators cover a ward. Removing a Corporator also removes that ward from its BLOs. */
+/**
+ * Sets the Corporator of a ward (a ward has at most one). Choosing a different Corporator moves the ward:
+ * the previous Corporator, and its BLOs, lose it.
+ */
 wardsRouter.put('/wards/:id/admins', authenticate, requireSuper, async (req, res) => {
   const actor = auth(req).admin;
   const wanted = strArray(req.body?.adminIds);
+  if (wanted.length > 1) fail(400, 'VALIDATION', 'A ward has one Corporator. Choose only one.');
   await withTransaction(async (db) => {
     const ward = (await db.query<Ward>('SELECT id, number FROM wards WHERE id = $1 FOR UPDATE', [str(req.params.id)])).rows[0];
     if (!ward) fail(404, 'NOT_FOUND', 'Ward not found.');
@@ -178,18 +186,21 @@ wardsRouter.put('/wards/:id/admins', authenticate, requireSuper, async (req, res
   res.status(204).end();
 });
 
-/** Sets which BLOs work this booth. Assigning a booth also assigns its ward; the BLO's Corporator must cover that ward. */
-wardsRouter.put('/booths/:id/admins', authenticate, requireSuper, async (req, res) => {
+/**
+ * Sets which BLOs work this booth. Assigning a booth also assigns its ward; the BLO's Corporator must cover that ward.
+ * A Corporator changes only its own BLOs, on booths in its wards.
+ */
+wardsRouter.put('/booths/:id/admins', authenticate, requireWardManager, async (req, res) => {
   const actor = auth(req).admin;
   const wanted = strArray(req.body?.adminIds);
   await withTransaction(async (db) => {
     const booth = (await db.query<Booth>(`SELECT ${BOOTH_COLUMNS} FROM booths WHERE id = $1 FOR UPDATE`, [str(req.params.id)])).rows[0];
-    if (!booth) fail(404, 'NOT_FOUND', 'Booth not found.');
+    if (!booth || !ownsWard(actor, booth.wardId)) fail(404, 'NOT_FOUND', 'Booth not found.');
     const admins = (await db.query<{ id: string; has: boolean; allowed: boolean }>(
       `SELECT a.id, EXISTS (SELECT 1 FROM admin_booths ab WHERE ab.admin_id = a.id AND ab.booth_id = $1) AS has,
          EXISTS (SELECT 1 FROM admin_wards cw WHERE cw.admin_id = a.corporator_id AND cw.ward_id = $2) AS allowed
-       FROM admins a WHERE a.role = 'BLO' ORDER BY a.id FOR UPDATE OF a`,
-      [booth.id, booth.wardId],
+       FROM admins a WHERE a.role = 'BLO' AND ($3::text IS NULL OR a.corporator_id = $3) ORDER BY a.id FOR UPDATE OF a`,
+      [booth.id, booth.wardId, actor.role === 'CORPORATOR' ? actor.id : null],
     )).rows;
     const outside = admins.filter((a) => wanted.includes(a.id) && !a.has && !a.allowed).map((a) => a.id);
     if (outside.length) {

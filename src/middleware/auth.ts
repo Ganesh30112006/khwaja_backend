@@ -65,6 +65,16 @@ export function requireSuper(req: Request, _res: Response, next: NextFunction): 
   next();
 }
 
+/**
+ * The Super Admin, and Corporators inside their own wards, manage voters, imports, booths and payments.
+ * Routes using this must also check the ward with assertOwnWard().
+ */
+export function requireWardManager(req: Request, _res: Response, next: NextFunction): void {
+  const role = auth(req).admin.role;
+  if (role !== 'SUPER_ADMIN' && role !== 'CORPORATOR') fail(403, 'FORBIDDEN', 'Only the Super Admin and Corporators can perform this action.');
+  next();
+}
+
 /** The Super Admin and Corporators manage accounts (a Corporator only its own BLOs). */
 export function requireManager(req: Request, _res: Response, next: NextFunction): void {
   const role = auth(req).admin.role;

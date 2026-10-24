@@ -3,6 +3,10 @@
 export const VOTER_STATUSES = ['Active', 'Not Active', 'Shifted'] as const;
 export type VoterStatus = (typeof VOTER_STATUSES)[number];
 
+/** '' when the roll does not say. */
+export const GENDERS = ['Male', 'Female', 'Other'] as const;
+export type Gender = (typeof GENDERS)[number] | '';
+
 export const MAX_DONATION_AMOUNT = 100000;
 export const PASSWORD_RULES = 'At least 8 characters with letters and numbers';
 export const HOUSEHOLD_ID_PATTERN = /^[A-Za-z0-9\-/]+$/;

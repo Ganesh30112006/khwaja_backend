@@ -145,9 +145,9 @@ export async function seedDemo(db: pg.PoolClient, password: string, now = Date.n
   }
   for (const v of voters) {
     await db.query(
-      `INSERT INTO voters (record_id, voter_id, full_name, mobile, ward_id, booth_id, house_number, household_id, address, status, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)`,
-      [v.recordId, v.voterId, v.fullName, v.mobile, v.wardId, v.boothId, v.houseNumber, v.householdId, v.address, v.status, v.createdAt],
+      `INSERT INTO voters (record_id, voter_id, full_name, ward_id, booth_id, house_number, household_id, address, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
+      [v.recordId, v.voterId, v.fullName, v.wardId, v.boothId, v.houseNumber, v.householdId, v.address, v.status, v.createdAt],
     );
   }
   let auditSeq = 0;

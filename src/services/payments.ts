@@ -23,7 +23,7 @@ export interface PaymentTransaction {
 
 /** Payment columns (alias t) in the API shape; statusReason is omitted when empty (see cleanTxn). */
 export const TXN_COLUMNS = `t.id, t.voter_record_id AS "voterRecordId", t.voter_id AS "voterId", t.voter_name AS "voterName",
-  t.ward_id AS "wardId", t.booth_id AS "boothId", t.amount, t.receiver_name AS "receiverName",
+  t.ward_id AS "wardId", COALESCE(t.booth_id, '') AS "boothId", t.amount, t.receiver_name AS "receiverName",
   t.receiver_mobile AS "receiverMobile", t."timestamp", t.admin_id AS "adminId", t.admin_name AS "adminName",
   t.status, t.status_reason AS "statusReason"`;
 
@@ -33,6 +33,21 @@ export function cleanTxn<T extends { statusReason?: string | null }>(t: T): T {
   if (t.statusReason == null) delete t.statusReason;
   return t;
 }
+
+/**
+ * Corporators and BLOs are never told that Super Admins exist: work a Super Admin did carries no account at all
+ * (empty adminId and adminName). Only the Super Admin has a scope covering everything.
+ */
+export function hideSuperAdmin<T extends { adminId: string; adminName?: string }>(scope: { all: boolean }, row: T): T {
+  if (scope.all || !row.adminId.startsWith('SA-')) return row;
+  return { ...row, adminId: '', adminName: '' };
+}
+
+/** cleanTxn plus hideSuperAdmin, for `.map()` over payments sent to the given viewer. */
+export const txnFor =
+  (scope: { all: boolean }) =>
+  <T extends PaymentTransaction>(t: T): T =>
+    hideSuperAdmin(scope, cleanTxn(t));
 
 export interface PaymentSettings {
   defaultAmount: number;

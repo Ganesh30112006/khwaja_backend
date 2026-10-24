@@ -2,19 +2,23 @@ import { isUniqueViolation, type Db } from '../db/pool.js';
 import { covers, type Scope } from '../lib/admins.js';
 import { ApiError, fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
-import { HOUSEHOLD_ID_PATTERN, isValidIndianMobile, normalizeMobile, pad, str, VOTER_STATUSES, type VoterStatus } from '../lib/validation.js';
-import { cleanTxn, TXN_SELECT, type PaymentTransaction } from './payments.js';
+import { GENDERS, HOUSEHOLD_ID_PATTERN, pad, str, VOTER_STATUSES, type Gender, type VoterStatus } from '../lib/validation.js';
+import { TXN_SELECT, txnFor, type PaymentTransaction } from './payments.js';
 
 export interface VoterInput {
   voterId: string;
   fullName: string;
-  mobile: string;
   wardId: string;
+  /** Optional: '' when the voter has no booth (ward rolls have none). */
   boothId: string;
   houseNumber: string;
   householdId: string;
   address: string;
   status: VoterStatus;
+  /** As printed on the roll (వయస్సు); null when unknown. */
+  age: number | null;
+  /** As printed on the roll (లింగము); '' when unknown. */
+  gender: Gender;
 }
 
 export interface Voter extends VoterInput {
@@ -29,9 +33,9 @@ export interface VoterListItem extends Voter {
   canRecordPayment: boolean;
 }
 
-export const VOTER_COLUMNS = `v.record_id AS "recordId", v.voter_id AS "voterId", v.full_name AS "fullName", v.mobile,
-  v.ward_id AS "wardId", v.booth_id AS "boothId", v.house_number AS "houseNumber", v.household_id AS "householdId",
-  v.address, v.status, v.created_at AS "createdAt", v.updated_at AS "updatedAt"`;
+export const VOTER_COLUMNS = `v.record_id AS "recordId", v.voter_id AS "voterId", v.full_name AS "fullName",
+  v.ward_id AS "wardId", COALESCE(v.booth_id, '') AS "boothId", v.house_number AS "houseNumber", v.household_id AS "householdId",
+  v.address, v.status, v.age, v.gender, v.created_at AS "createdAt", v.updated_at AS "updatedAt"`;
 
 /** Ward → booth IDs, loaded once per request (imports validate many rows against it). */
 export type LocationRefs = Map<string, Set<string>>;
@@ -54,10 +58,12 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   const houseNumber = str(body.houseNumber).trim();
   const householdId = str(body.householdId).trim();
   const address = str(body.address).trim();
-  const mobileRaw = str(body.mobile).trim();
   const wardId = str(body.wardId);
   const boothId = str(body.boothId);
   const status = body.status as VoterStatus;
+  const ageRaw = body.age === null || body.age === undefined ? '' : String(body.age).trim();
+  const age = ageRaw === '' ? null : Number(ageRaw);
+  const gender = str(body.gender) as Gender;
 
   if (!voterId) errors.voterId = 'Voter ID is required';
   else if (voterId.length > 30) errors.voterId = 'Voter ID is too long';
@@ -66,10 +72,11 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   if (!houseNumber) errors.houseNumber = 'House number is required';
   else if (houseNumber.length > 30) errors.houseNumber = 'House number is too long';
   if (address.length > 250) errors.address = 'Address is too long';
-  if (mobileRaw && !isValidIndianMobile(mobileRaw)) errors.mobile = 'Enter a valid 10-digit Indian mobile number';
   if (!refs.has(wardId)) errors.wardId = 'Select a valid ward';
-  else if (!refs.get(wardId)!.has(boothId)) errors.boothId = 'Select a booth in this ward';
+  else if (boothId && !refs.get(wardId)!.has(boothId)) errors.boothId = 'Select a booth in this ward';
   if (!VOTER_STATUSES.includes(status)) errors.status = 'Select a voter status';
+  if (age !== null && (!Number.isInteger(age) || age < 18 || age > 120)) errors.age = 'Age must be a whole number from 18 to 120';
+  if (gender && !(GENDERS as readonly string[]).includes(gender)) errors.gender = 'Choose Male, Female or Other';
   if (householdId) {
     if (householdId.length > 30) errors.householdId = 'Household ID is too long';
     else if (!HOUSEHOLD_ID_PATTERN.test(householdId)) errors.householdId = 'Use letters, numbers, - or / only';
@@ -84,7 +91,7 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   failIfErrors(errors);
   const { rowCount } = await db.query('SELECT 1 FROM voters WHERE upper(voter_id) = upper($1) AND record_id <> $2', [voterId, excludeRecordId ?? '']);
   if (rowCount) throw voterIdConflict();
-  return { voterId, fullName, mobile: mobileRaw ? normalizeMobile(mobileRaw) : '', wardId, boothId, houseNumber, householdId, address, status };
+  return { voterId, fullName, wardId, boothId, houseNumber, householdId, address, status, age, gender };
 }
 
 export function voterIdConflict(): ApiError {
@@ -95,7 +102,7 @@ export function voterIdConflict(): ApiError {
 export async function toListItems(db: Db, scope: Scope, voters: Voter[]): Promise<VoterListItem[]> {
   const ids = voters.map((v) => v.recordId);
   const txs = ids.length
-    ? (await db.query<PaymentTransaction>(`${TXN_SELECT} WHERE t.voter_record_id = ANY($1) AND t.status = 'Success'`, [ids])).rows.map(cleanTxn)
+    ? (await db.query<PaymentTransaction>(`${TXN_SELECT} WHERE t.voter_record_id = ANY($1) AND t.status = 'Success'`, [ids])).rows.map(txnFor(scope))
     : [];
   const byVoter = new Map(txs.map((t) => [t.voterRecordId, t]));
   return voters.map((v) => {
@@ -104,7 +111,7 @@ export async function toListItems(db: Db, scope: Scope, voters: Voter[]): Promis
       ...v,
       paymentStatus: tx ? 'Received' : 'Not Received',
       latestPayment: tx,
-      canRecordPayment: !tx && covers(scope, v),
+      canRecordPayment: !tx && v.status === 'Active' && covers(scope, v),
     };
   });
 }
@@ -115,14 +122,36 @@ export async function loadVoter(db: Db, recordId: string, lock = false): Promise
   return rows[0];
 }
 
+/** The voter with this Voter ID (any case), if there is one. */
+export async function findVoterByVoterId(db: Db, voterId: string, lock = false): Promise<Voter | undefined> {
+  const { rows } = await db.query<Voter>(`SELECT ${VOTER_COLUMNS} FROM voters v WHERE upper(v.voter_id) = upper($1)${lock ? ' FOR UPDATE' : ''}`, [voterId.trim()]);
+  return rows[0];
+}
+
+/** Saves validated details over an existing voter (the voter form, or an import that replaces a voter). */
+export async function updateVoter(db: Db, recordId: string, input: VoterInput): Promise<Voter> {
+  const { rows } = await db
+    .query<Voter>(
+      `UPDATE voters v SET voter_id = $2, full_name = $3, ward_id = $4, booth_id = NULLIF($5, ''), house_number = $6, household_id = $7,
+         address = $8, status = $9, age = $10, gender = $11, updated_at = now()
+       WHERE record_id = $1 RETURNING ${VOTER_COLUMNS}`,
+      [recordId, input.voterId, input.fullName, input.wardId, input.boothId, input.houseNumber, input.householdId, input.address, input.status, input.age, input.gender],
+    )
+    .catch((err) => {
+      if (isUniqueViolation(err, 'voters_voter_id_ci_idx')) throw voterIdConflict();
+      throw err;
+    });
+  return rows[0];
+}
+
 /** Inserts a validated voter. Used by the voter form and the import. */
 export async function insertVoter(db: Db, input: VoterInput): Promise<Voter> {
   const recordId = `VR-${pad(await nextNumber(db, 'voter'), 6)}`;
   const { rows } = await db
     .query<Voter>(
-      `INSERT INTO voters AS v (record_id, voter_id, full_name, mobile, ward_id, booth_id, house_number, household_id, address, status, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now()) RETURNING ${VOTER_COLUMNS}`,
-      [recordId, input.voterId, input.fullName, input.mobile, input.wardId, input.boothId, input.houseNumber, input.householdId, input.address, input.status],
+      `INSERT INTO voters AS v (record_id, voter_id, full_name, ward_id, booth_id, house_number, household_id, address, status, age, gender, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11, now(), now()) RETURNING ${VOTER_COLUMNS}`,
+      [recordId, input.voterId, input.fullName, input.wardId, input.boothId, input.houseNumber, input.householdId, input.address, input.status, input.age, input.gender],
     )
     .catch((err) => {
       if (isUniqueViolation(err, 'voters_voter_id_ci_idx')) throw voterIdConflict();

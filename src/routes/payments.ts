@@ -7,8 +7,8 @@ import { nextNumber } from '../lib/ids.js';
 import { pageWindow } from '../lib/pagination.js';
 import { sqlLocalDate } from '../lib/time.js';
 import { formatInr, isValidAmount, isValidDate, isValidIndianMobile, likePattern, normalizeMobile, pad, str } from '../lib/validation.js';
-import { auth, authenticate, requireSuper } from '../middleware/auth.js';
-import { cleanTxn, currentAmount, loadSettings, TXN_COLUMNS, TXN_SELECT, type PaymentTransaction } from '../services/payments.js';
+import { auth, authenticate, requireWardManager } from '../middleware/auth.js';
+import { cleanTxn, currentAmount, hideSuperAdmin, loadSettings, TXN_COLUMNS, TXN_SELECT, txnFor, type PaymentTransaction } from '../services/payments.js';
 import { loadVoter } from '../services/voters.js';
 
 export const paymentsRouter = Router();
@@ -46,6 +46,8 @@ paymentsRouter.post('/payments', async (req, res) => {
     const replay = await findReplay(db, admin.id, key);
     if (replay) return { tx: replay, replay: true };
     if (!covers(scope, voter)) fail(403, 'FORBIDDEN', 'This voter is outside your assigned area.');
+    // Only Active voters are paid (Shifted and Not Active, e.g. deceased, are not).
+    if (voter.status !== 'Active') fail(409, 'CONFLICT', `This voter is ${voter.status} and cannot receive a payment.`);
 
     const errors: Record<string, string> = {};
     const amount = Number(body.amount);
@@ -71,7 +73,7 @@ paymentsRouter.post('/payments', async (req, res) => {
         `INSERT INTO payment_transactions AS t (id, voter_record_id, voter_id, voter_name, ward_id, booth_id, amount, receiver_name, receiver_mobile, "timestamp", admin_id, admin_name, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, 'Success')
          RETURNING ${TXN_COLUMNS}`,
-        [id, voter.recordId, voter.voterId, voter.fullName, voter.wardId, voter.boothId, amount, receiverName, normalizeMobile(receiverMobile), admin.id, admin.fullName],
+        [id, voter.recordId, voter.voterId, voter.fullName, voter.wardId, voter.boothId || null, amount, receiverName, normalizeMobile(receiverMobile), admin.id, admin.fullName],
       )
       .catch((err) => {
         if (isUniqueViolation(err, 'payment_one_success_per_voter_idx')) fail(409, 'CONFLICT', 'This voter has already received a payment.');
@@ -122,7 +124,7 @@ paymentsRouter.get('/payments', async (req, res) => {
   const total = (await pool.query<{ n: number }>(`SELECT count(*) AS n FROM payment_transactions t ${filter}`, p.values)).rows[0].n;
   const win = pageWindow(total, req.query.page, req.query.pageSize);
   const { rows } = await pool.query<PaymentTransaction>(`${TXN_SELECT} ${filter} ${paymentOrder(req.query)} LIMIT ${win.pageSize} OFFSET ${win.offset}`, p.values);
-  res.json({ items: rows.map(cleanTxn), total, page: win.page, pageSize: win.pageSize });
+  res.json({ items: rows.map(txnFor(scope)), total, page: win.page, pageSize: win.pageSize });
 });
 
 paymentsRouter.get('/payments/export', async (req, res) => {
@@ -130,7 +132,7 @@ paymentsRouter.get('/payments/export', async (req, res) => {
   const p = new Params();
   const { rows } = await pool.query<PaymentTransaction>(`${TXN_SELECT} ${paymentFilter(req.query, admin, scope, p)} ${paymentOrder(req.query)}`, p.values);
   await addAudit(pool, admin, 'Payments exported', 'Export', 'payments', `${rows.length} payments`);
-  res.json(rows.map(cleanTxn));
+  res.json(rows.map(txnFor(scope)));
 });
 
 async function loadVisiblePayment(db: Db, scope: Scope, id: string, lock = false): Promise<PaymentTransaction> {
@@ -144,11 +146,14 @@ paymentsRouter.get('/payments/:id', async (req, res) => {
   const { scope } = auth(req);
   const transaction = await loadVisiblePayment(pool, scope, str(req.params.id));
   const audit = (await pool.query<AuditLog>(`SELECT ${AUDIT_COLUMNS} FROM audit_logs WHERE record_ref = $1 ORDER BY "timestamp" DESC, seq DESC`, [transaction.id])).rows;
-  res.json({ transaction, audit });
+  res.json({ transaction: hideSuperAdmin(scope, transaction), audit: audit.map((a) => hideSuperAdmin(scope, a)) });
 });
 
-/** Super Admin cancels or reverses a mistaken payment. The record is kept; the voter becomes Not Received. */
-paymentsRouter.post('/payments/:id/cancel', requireSuper, async (req, res) => {
+/**
+ * The Super Admin, or a Corporator for payments in its wards, cancels or reverses a mistaken payment.
+ * The record is kept; the voter becomes Not Received.
+ */
+paymentsRouter.post('/payments/:id/cancel', requireWardManager, async (req, res) => {
   const { admin, scope } = auth(req);
   const tx = await withTransaction(async (db) => {
     const current = await loadVisiblePayment(db, scope, str(req.params.id), true);
