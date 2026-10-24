@@ -15,17 +15,16 @@ export const adminsRouter = Router();
 adminsRouter.use('/admins', authenticate, requireManager);
 
 /**
- * Setting a password can reveal that another account with the same name uses it, so failed
- * attempts are throttled per signed-in account, like failed logins.
+ * Setting a password can reveal that another account with the same name uses it. Every attempt is
+ * counted (an accepted password is a wrong guess too), per signed-in account.
  */
 const passwordWriteLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 20,
+  windowMs: 60 * 60 * 1000,
+  limit: 30,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skipSuccessfulRequests: true,
   keyGenerator: (req) => `admin:${req.auth?.admin.id ?? 'anonymous'}`,
-  message: { message: 'Too many attempts. Please wait 15 minutes and try again.' },
+  message: { message: 'Too many password changes. Please wait an hour and try again.' },
 });
 
 interface AdminInput {
@@ -281,6 +280,8 @@ adminsRouter.put('/admins/:id/password', passwordWriteLimiter, async (req, res) 
   const actor = auth(req).admin;
   const password = req.body?.password;
   const target = await loadManaged(pool, actor, str(req.params.id));
+  // Each Super Admin changes only its own password (My Profile).
+  if (target.role === 'SUPER_ADMIN') fail(403, 'FORBIDDEN', "A Super Admin's password can only be changed by that Super Admin.");
   if (!isValidPassword(password)) fail(400, 'VALIDATION', 'Password does not meet the requirements.', { password: PASSWORD_RULES });
   if (await passwordTakenForName(pool, target.fullName, password, target.id)) throw passwordTakenError(target.fullName, 'password');
   const hash = await hashPassword(password);

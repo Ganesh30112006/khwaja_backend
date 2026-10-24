@@ -21,6 +21,19 @@ const loginLimiter = rateLimit({
   message: { message: 'Too many login attempts. Please wait 15 minutes and try again.' },
 });
 
+/**
+ * A new password is checked against same-named accounts, which can reveal their password, so every
+ * change attempt is counted per account (right or wrong current password, accepted or not).
+ */
+const passwordChangeLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator: (req) => `admin:${req.auth?.admin.id ?? 'anonymous'}`,
+  message: { message: 'Too many password changes. Please wait an hour and try again.' },
+});
+
 /** Signs in with a mobile number or a full name. Names may repeat; the password tells same-named accounts apart. */
 authRouter.post('/auth/login', loginLimiter, async (req, res) => {
   const identifier = str(req.body?.identifier).trim().slice(0, 100);
@@ -74,7 +87,7 @@ authRouter.get('/auth/me', authenticate, (req, res) => {
   res.json(auth(req).admin);
 });
 
-authRouter.post('/auth/change-password', authenticate, async (req, res) => {
+authRouter.post('/auth/change-password', authenticate, passwordChangeLimiter, async (req, res) => {
   const { admin, sessionId } = auth(req);
   const currentPassword = str(req.body?.currentPassword);
   const newPassword = req.body?.newPassword;

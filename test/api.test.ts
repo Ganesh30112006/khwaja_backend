@@ -322,8 +322,10 @@ describe('Corporators and BLOs', () => {
     const supers = await expectStatus(call('get', '/admins', sa2, undefined, { role: 'SUPER_ADMIN' }), 200);
     expect(supers.items.map((a: { id: string }) => a.id)).toEqual(['SA-1']);
     await expectStatus(call('get', '/admins/SA-2', sa2), 404);
-    await expectStatus(call('put', '/admins/SA-1/password', sa2, { password: 'changed99' }), 204);
-    await expectStatus(call('get', '/auth/me', sa), 401);
+    // A Super Admin's password is changed only by that Super Admin.
+    await expectStatus(call('put', '/admins/SA-1/password', sa2, { password: 'changed99' }), 403);
+    await expectStatus(call('get', '/auth/me', sa), 200);
+    await expectStatus(call('put', '/admins/C-1/password', sa2, { password: 'changed99' }), 204);
     const audit = await expectStatus(call('get', '/audit-logs', sa2, undefined, { recordRef: 'SA-2' }), 200);
     expect(audit.items.map((a: { action: string }) => a.action)).toContain('Super Admin created');
   });
@@ -405,6 +407,15 @@ describe('Corporators and BLOs', () => {
     await expectStatus(call('get', '/auth/me', other), 401);
     await expectStatus(call('get', '/auth/me', blo), 200);
     await login(BLO_MOBILE, 'mynewpass1');
+  });
+
+  it('counts every password change attempt, so the same-name check cannot be used to guess passwords', async () => {
+    const c2 = await login(C2_MOBILE);
+    // Accepted and rejected attempts both count: 10 per hour per account.
+    for (let i = 0; i < 10; i++) {
+      await expectStatus(call('post', '/auth/change-password', c2, { currentPassword: 'wrong', newPassword: `guess${i}pass` }), 400);
+    }
+    await expectStatus(call('post', '/auth/change-password', c2, { currentPassword: PASSWORD, newPassword: 'another9pass' }), 429);
   });
 
   it('Corporators and BLOs cannot use Super Admin endpoints; BLOs cannot manage wards or voters', async () => {
