@@ -3,6 +3,8 @@
 #
 # AWS access is through GitHub OIDC (no AWS keys stored in GitHub): the role trusts only this repo's
 # "production" environment. The values below are not secrets; repository variables of the same name override them.
+# GitHub sends the subject with numeric IDs: repo:Ganesh30112006@204135162/khwaja_backend@1431622954:environment:production
+# (the role trust policy must match it exactly; renaming or re-creating the repo changes the repo ID).
 name: CI/CD
 
 on:
