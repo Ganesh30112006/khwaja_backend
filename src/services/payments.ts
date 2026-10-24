@@ -17,6 +17,8 @@ export interface PaymentTransaction {
   timestamp: Date;
   adminId: string;
   adminName: string;
+  /** Who handed over the cash, as typed on the payment form (prefilled with the account name). */
+  givenByName: string;
   status: TransactionStatus;
   statusReason?: string;
 }
@@ -25,7 +27,7 @@ export interface PaymentTransaction {
 export const TXN_COLUMNS = `t.id, t.voter_record_id AS "voterRecordId", t.voter_id AS "voterId", t.voter_name AS "voterName",
   t.ward_id AS "wardId", COALESCE(t.booth_id, '') AS "boothId", t.amount, t.receiver_name AS "receiverName",
   t.receiver_mobile AS "receiverMobile", t."timestamp", t.admin_id AS "adminId", t.admin_name AS "adminName",
-  t.status, t.status_reason AS "statusReason"`;
+  t.given_by_name AS "givenByName", t.status, t.status_reason AS "statusReason"`;
 
 export const TXN_SELECT = `SELECT ${TXN_COLUMNS} FROM payment_transactions t`;
 
@@ -36,11 +38,11 @@ export function cleanTxn<T extends { statusReason?: string | null }>(t: T): T {
 
 /**
  * Corporators and BLOs are never told that Super Admins exist: work a Super Admin did carries no account at all
- * (empty adminId and adminName). Only the Super Admin has a scope covering everything.
+ * (empty adminId, adminName and, on payments, givenByName). Only the Super Admin has a scope covering everything.
  */
-export function hideSuperAdmin<T extends { adminId: string; adminName?: string }>(scope: { all: boolean }, row: T): T {
+export function hideSuperAdmin<T extends { adminId: string; adminName?: string; givenByName?: string }>(scope: { all: boolean }, row: T): T {
   if (scope.all || !row.adminId.startsWith('SA-')) return row;
-  return { ...row, adminId: '', adminName: '' };
+  return { ...row, adminId: '', adminName: '', ...('givenByName' in row ? { givenByName: '' } : {}) };
 }
 
 /** cleanTxn plus hideSuperAdmin, for `.map()` over payments sent to the given viewer. */

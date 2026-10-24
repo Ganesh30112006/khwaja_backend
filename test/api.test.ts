@@ -29,7 +29,14 @@ async function notReceivedVoter(token: string, query: Record<string, unknown> = 
   return (await voters(token, { paymentStatus: 'Not Received', status: 'Active', ...query }))[0];
 }
 
-const pay = (voterRecordId: string, idempotencyKey: string) => ({ voterRecordId, amount: 2000, receiverName: 'Ravi', receiverMobile: '9123412345', idempotencyKey });
+const pay = (voterRecordId: string, idempotencyKey: string) => ({
+  voterRecordId,
+  amount: 2000,
+  receiverName: 'Ravi',
+  receiverMobile: '9123412345',
+  givenByName: 'Giver Name',
+  idempotencyKey,
+});
 
 describe('authentication', () => {
   it('logs in with a mobile number (any format) or the full name', async () => {
@@ -105,8 +112,8 @@ describe('payments', () => {
     const token = await login(C1_MOBILE);
     const voter = await notReceivedVoter(token);
     const before = Date.now();
-    const tx = await expectStatus(call('post', '/payments', token, { ...pay(voter.recordId, 'k1'), receiverName: 'Someone Else', receiverMobile: '+91 91234 12345' }), 201);
-    expect(tx).toMatchObject({ adminId: 'C-1', adminName: 'Ramesh Babu', receiverMobile: '9123412345', status: 'Success', amount: 2000 });
+    const tx = await expectStatus(call('post', '/payments', token, { ...pay(voter.recordId, 'k1'), receiverName: 'Someone Else', receiverMobile: '+91 91234 12345', givenByName: '  Suresh   Kumar ' }), 201);
+    expect(tx).toMatchObject({ adminId: 'C-1', adminName: 'Ramesh Babu', givenByName: 'Suresh Kumar', receiverMobile: '9123412345', status: 'Success', amount: 2000 });
     expect(new Date(tx.timestamp).getTime()).toBeGreaterThanOrEqual(before - 1000);
     expect(tx.statusReason).toBeUndefined();
     const detail = await expectStatus(call('get', `/voters/${voter.recordId}`, token), 200);
@@ -196,13 +203,31 @@ describe('payments', () => {
     const tx = await expectStatus(call('post', '/payments', sa, pay(target.recordId, 'sa-pay')), 201);
     for (const token of [await login(C1_MOBILE), await login(BLO_MOBILE)]) {
       const list = await expectStatus(call('get', '/payments', token, undefined, { pageSize: 100 }), 200);
-      expect(list.items.find((t: { id: string }) => t.id === tx.id)).toMatchObject({ adminId: '', adminName: '' });
+      expect(list.items.find((t: { id: string }) => t.id === tx.id)).toMatchObject({ adminId: '', adminName: '', givenByName: '' });
       const detail = await expectStatus(call('get', `/payments/${tx.id}`, token), 200);
-      expect(JSON.stringify(detail)).not.toMatch(/SA-1|Super Admin/);
+      expect(JSON.stringify(detail)).not.toMatch(/SA-1|Super Admin|Giver Name/);
       const voter = await expectStatus(call('get', `/voters/${target.recordId}`, token), 200);
       expect(JSON.stringify(voter)).not.toMatch(/SA-1|Super Admin/);
     }
     expect((await expectStatus(call('get', `/payments/${tx.id}`, sa), 200)).transaction.adminId).toBe('SA-1');
+  });
+
+  it('a Corporator filters payment history by who gave the money: itself or its own BLOs only', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const blo = await login(BLO_MOBILE);
+    const c1 = await login(C1_MOBILE);
+    const byBlo = await expectStatus(call('post', '/payments', blo, pay((await notReceivedVoter(blo)).recordId, 'g-blo')), 201);
+    const bySa = await expectStatus(call('post', '/payments', sa, pay((await notReceivedVoter(sa, { boothId: 'B1-1' })).recordId, 'g-sa')), 201);
+    const given = async (adminId: string) =>
+      (await expectStatus(call('get', '/payments', c1, undefined, { adminId, pageSize: 100 }), 200)).items.map((t: { id: string }) => t.id);
+    const blos = await given('C-1-BLO1');
+    expect(blos).toContain(byBlo.id);
+    expect(blos).not.toContain(bySa.id);
+    // Filtering by a Super Admin ID must not reveal that its payments exist.
+    expect(await given('SA-1')).toEqual([]);
+    // A BLO's filter is ignored: it sees its usual area.
+    const bloView = (await expectStatus(call('get', '/payments', blo, undefined, { adminId: 'SA-1', pageSize: 100 }), 200)).items.map((t: { id: string }) => t.id);
+    expect(bloView).toContain(byBlo.id);
   });
 
   it('a Corporator can cancel payments in its wards; BLOs and other Corporators cannot', async () => {
@@ -239,8 +264,8 @@ describe('payments', () => {
   it('validates the amount and receiver, and enforces a fixed amount', async () => {
     const sa = await login(SUPER_MOBILE);
     const voter = await notReceivedVoter(sa);
-    const bad = await expectStatus(call('post', '/payments', sa, { voterRecordId: voter.recordId, amount: 10.5, receiverName: 'R', receiverMobile: '12345' }), 400);
-    expect(Object.keys(bad.fieldErrors).sort()).toEqual(['amount', 'receiverMobile', 'receiverName']);
+    const bad = await expectStatus(call('post', '/payments', sa, { voterRecordId: voter.recordId, amount: 10.5, receiverName: 'R', receiverMobile: '12345', givenByName: ' ' }), 400);
+    expect(Object.keys(bad.fieldErrors).sort()).toEqual(['amount', 'givenByName', 'receiverMobile', 'receiverName']);
     await expectStatus(call('put', '/settings/payment', sa, { defaultAmount: 1500, effectiveDate: '2000-01-01', allowAmountOverride: false }), 200);
     const c1 = await login(C1_MOBILE);
     expect(await expectStatus(call('get', '/payments/context', c1), 200)).toEqual({ suggestedAmount: 1500, amountEditable: false });

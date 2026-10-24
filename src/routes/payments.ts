@@ -53,10 +53,13 @@ paymentsRouter.post('/payments', async (req, res) => {
     const amount = Number(body.amount);
     const receiverName = str(body.receiverName).trim();
     const receiverMobile = str(body.receiverMobile).trim();
+    const givenByName = str(body.givenByName).trim().replace(/\s+/g, ' ');
     if (!isValidAmount(amount)) errors.amount = 'Enter a whole amount between ₹1 and ₹1,00,000';
     if (receiverName.length < 2) errors.receiverName = 'Receiver name is required';
     else if (receiverName.length > 100) errors.receiverName = 'Receiver name is too long';
     if (!isValidIndianMobile(receiverMobile)) errors.receiverMobile = 'Enter a valid 10-digit Indian mobile number';
+    if (givenByName.length < 2) errors.givenByName = 'Enter the name of the person giving the money';
+    else if (givenByName.length > 100) errors.givenByName = 'Name is too long';
     const ctx = await paymentContext(db);
     if (!errors.amount && !ctx.amountEditable && amount !== ctx.suggestedAmount) errors.amount = `Amount must be ${formatInr(ctx.suggestedAmount)}`;
     failIfErrors(errors);
@@ -70,10 +73,10 @@ paymentsRouter.post('/payments', async (req, res) => {
     const id = `TXN-${pad(await nextNumber(db, 'txn'), 6)}`;
     const { rows } = await db
       .query<PaymentTransaction>(
-        `INSERT INTO payment_transactions AS t (id, voter_record_id, voter_id, voter_name, ward_id, booth_id, amount, receiver_name, receiver_mobile, "timestamp", admin_id, admin_name, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, 'Success')
+        `INSERT INTO payment_transactions AS t (id, voter_record_id, voter_id, voter_name, ward_id, booth_id, amount, receiver_name, receiver_mobile, "timestamp", admin_id, admin_name, given_by_name, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, 'Success')
          RETURNING ${TXN_COLUMNS}`,
-        [id, voter.recordId, voter.voterId, voter.fullName, voter.wardId, voter.boothId || null, amount, receiverName, normalizeMobile(receiverMobile), admin.id, admin.fullName],
+        [id, voter.recordId, voter.voterId, voter.fullName, voter.wardId, voter.boothId || null, amount, receiverName, normalizeMobile(receiverMobile), admin.id, admin.fullName, givenByName],
       )
       .catch((err) => {
         if (isUniqueViolation(err, 'payment_one_success_per_voter_idx')) fail(409, 'CONFLICT', 'This voter has already received a payment.');
@@ -94,7 +97,12 @@ function paymentFilter(q: Request['query'], admin: Admin, scope: Scope, p: Param
   if (isValidDate(q.to)) where.push(`${sqlLocalDate('t."timestamp"')} <= ${p.add(q.to)}::date`);
   if (str(q.wardId)) where.push(`t.ward_id = ${p.add(str(q.wardId))}`);
   if (str(q.boothId)) where.push(`t.booth_id = ${p.add(str(q.boothId))}`);
+  // "Given by" filter: a Super Admin may pick anyone, a Corporator only itself or its own BLOs.
   if (str(q.adminId) && admin.role === 'SUPER_ADMIN') where.push(`t.admin_id = ${p.add(str(q.adminId))}`);
+  if (str(q.adminId) && admin.role === 'CORPORATOR') {
+    const me = p.add(admin.id);
+    where.push(`t.admin_id = ${p.add(str(q.adminId))}`, `t.admin_id IN (SELECT id FROM admins WHERE id = ${me} OR corporator_id = ${me})`);
+  }
   if (str(q.status)) where.push(`t.status = ${p.add(str(q.status))}`);
   const search = str(q.search).trim();
   if (search) {
