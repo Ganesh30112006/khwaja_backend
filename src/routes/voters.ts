@@ -87,16 +87,15 @@ votersRouter.post('/voters/status', authenticate, requireWardManager, async (req
       'SELECT upper(voter_id) AS "voterId", status, ward_id AS "wardId" FROM voters WHERE upper(voter_id) = ANY($1) FOR UPDATE',
       [ids],
     )).rows;
-    // A Corporator only changes voters in its own wards; the others are reported back.
+    // A Corporator only sees and changes voters in its own wards; others count as not found.
     const found = rows.filter((v) => ownsWard(actor, v.wardId));
-    const outsideArea = rows.filter((v) => !ownsWard(actor, v.wardId)).map((v) => v.voterId);
     const toChange = found.filter((v) => v.status !== status).map((v) => v.voterId);
     if (toChange.length) {
       await db.query('UPDATE voters SET status = $2, updated_at = now() WHERE upper(voter_id) = ANY($1)', [toChange, status]);
       await addAudit(db, actor, 'Voter status changed', 'Voter', fileName, `${toChange.length} voters → ${status} (from ${fileName})`);
     }
-    const foundIds = new Set(rows.map((v) => v.voterId));
-    return { updated: toChange.length, unchanged: found.length - toChange.length, notFound: ids.filter((id) => !foundIds.has(id)), outsideArea };
+    const foundIds = new Set(found.map((v) => v.voterId));
+    return { updated: toChange.length, unchanged: found.length - toChange.length, notFound: ids.filter((id) => !foundIds.has(id)) };
   });
   res.json(result);
 });
@@ -121,16 +120,19 @@ votersRouter.get('/voters/duplicate-check', authenticate, requireWardManager, as
         [voterId, exclude],
       )).rows[0]
     : undefined;
+  const actor = auth(req).admin;
   const voterIdExists = !!match;
-  // Lets the form offer "keep the existing voter" or "replace its details" (only inside the caller's wards).
-  const existing = match ? { ...match, canReplace: ownsWard(auth(req).admin, match.wardId) } : null;
+  // Lets the form offer "keep the existing voter" or "replace its details". A voter outside the
+  // caller's wards is only reported as existing: its name and ward stay hidden.
+  const existing = match && ownsWard(actor, match.wardId) ? { ...match, canReplace: true } : null;
+  const wardId = str(req.query.wardId);
   const similar =
-    fullName && houseNumber
+    fullName && houseNumber && ownsWard(actor, wardId)
       ? (await pool.query(
           `SELECT record_id AS "recordId", voter_id AS "voterId", full_name AS "fullName", house_number AS "houseNumber"
            FROM voters WHERE ward_id = $1 AND lower(full_name) = lower($2) AND lower(house_number) = lower($3) AND record_id <> $4
            ORDER BY record_id LIMIT 5`,
-          [str(req.query.wardId), fullName, houseNumber, exclude],
+          [wardId, fullName, houseNumber, exclude],
         )).rows
       : [];
   res.json({ voterIdExists, existing, similar });

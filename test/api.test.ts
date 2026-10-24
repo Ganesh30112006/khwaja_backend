@@ -243,7 +243,7 @@ describe('payments', () => {
     const sa = await login(SUPER_MOBILE);
     const [a, b] = await voters(sa, { paymentStatus: 'Not Received', status: 'Active', wardId: 'W1', pageSize: 2 });
     const res = await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId.toLowerCase(), b.voterId, 'NOPE123'], status: 'Shifted', fileName: 'shifted.pdf' }), 200);
-    expect(res).toEqual({ updated: 2, unchanged: 0, notFound: ['NOPE123'], outsideArea: [] });
+    expect(res).toEqual({ updated: 2, unchanged: 0, notFound: ['NOPE123'] });
     const again = await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Shifted' }), 200);
     expect(again).toMatchObject({ updated: 0, unchanged: 1 });
     const detail = await expectStatus(call('get', `/voters/${a.recordId}`, sa), 200);
@@ -253,9 +253,9 @@ describe('payments', () => {
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [b.voterId], status: 'Not Active' }), 200);
     await expectStatus(call('post', '/payments', sa, pay(b.recordId, 'deceased-pay')), 409);
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Gone' }), 400);
-    // C-2 covers ward 3 only: a voter in ward 1 is reported, not changed. BLOs cannot do this at all.
+    // C-2 covers ward 3 only: a voter in ward 1 is not changed and looks like it does not exist. BLOs cannot do this at all.
     const c2 = await expectStatus(call('post', '/voters/status', await login(C2_MOBILE), { voterIds: [a.voterId], status: 'Active' }), 200);
-    expect(c2).toMatchObject({ updated: 0, outsideArea: [a.voterId.toUpperCase()] });
+    expect(c2).toEqual({ updated: 0, unchanged: 0, notFound: [a.voterId.toUpperCase()] });
     await expectStatus(call('post', '/voters/status', await login(BLO_MOBILE), { voterIds: [a.voterId], status: 'Active' }), 403);
     const audit = await expectStatus(call('get', '/audit-logs', sa, undefined, { recordRef: 'shifted.pdf' }), 200);
     expect(audit.items[0].summary).toBe('2 voters → Shifted (from shifted.pdf)');
@@ -382,6 +382,18 @@ describe('Corporators and BLOs', () => {
     const w1 = summary.find((w: { id: string }) => w.id === 'W1');
     expect(w1.adminIds).toEqual(['C-1']);
     expect(w1.booths.find((b: { id: string }) => b.id === 'B1-3').adminIds).toEqual(['C-1-BLO1']);
+  });
+
+  it('taking a BLO off its last booth in a ward removes that ward instead of giving it the whole ward', async () => {
+    const c1 = await login(C1_MOBILE);
+    // C-1-BLO1 works booths B1-1 and B1-2 of ward 1 only.
+    await expectStatus(call('put', '/booths/B1-1/admins', c1, { adminIds: [] }), 204);
+    let blo = await expectStatus(call('get', '/admins/C-1-BLO1', c1), 200);
+    expect(blo).toMatchObject({ wardIds: ['W1'], boothIds: ['B1-2'] });
+    await expectStatus(call('put', '/booths/B1-2/admins', c1, { adminIds: [] }), 204);
+    blo = await expectStatus(call('get', '/admins/C-1-BLO1', c1), 200);
+    expect(blo).toMatchObject({ wardIds: [], boothIds: [] });
+    expect(await voters(await login(BLO_MOBILE))).toEqual([]);
   });
 
   it('rejects a duplicate mobile number', async () => {
@@ -564,6 +576,19 @@ describe('voters', () => {
     expect(r.similar.map((s: { recordId: string }) => s.recordId)).toContain(v.recordId);
     const self = await expectStatus(call('get', '/voters/duplicate-check', sa, undefined, { voterId: v.voterId, fullName: '', houseNumber: '', wardId: v.wardId, excludeRecordId: v.recordId }), 200);
     expect(self.voterIdExists).toBe(false);
+  });
+
+  it('never shows a Corporator voters outside its wards (duplicate check, import context)', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const c2 = await login(C2_MOBILE);
+    const outside = (await voters(sa, { wardId: 'W1', pageSize: 1 }))[0];
+    const dup = await expectStatus(call('get', '/voters/duplicate-check', c2, undefined, { voterId: outside.voterId, fullName: outside.fullName, houseNumber: outside.houseNumber, wardId: 'W1' }), 200);
+    expect(dup).toEqual({ voterIdExists: true, existing: null, similar: [] });
+    const ctx = await expectStatus(call('get', '/imports/context', c2), 200);
+    expect(ctx.existingVoterIds).not.toContain(outside.voterId.toUpperCase());
+    const own = (await voters(c2, { pageSize: 1 }))[0];
+    expect(ctx.existingVoterIds).toContain(own.voterId.toUpperCase());
+    expect(ctx.households.every((h: string[]) => h[1] === own.wardId)).toBe(true);
   });
 });
 

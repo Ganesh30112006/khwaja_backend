@@ -215,6 +215,13 @@ wardsRouter.put('/booths/:id/admins', authenticate, requireWardManager, async (r
         changed.push(`+${a.id}`);
       } else if (!want && a.has) {
         await db.query('DELETE FROM admin_booths WHERE admin_id = $1 AND booth_id = $2', [a.id, booth.id]);
+        // A BLO with no booths in a ward covers the whole ward, so taking away its last booth there
+        // must take away the ward too, never widen its access.
+        await db.query(
+          `DELETE FROM admin_wards aw WHERE aw.admin_id = $1 AND aw.ward_id = $2
+             AND NOT EXISTS (SELECT 1 FROM admin_booths ab JOIN booths b ON b.id = ab.booth_id WHERE ab.admin_id = $1 AND b.ward_id = $2)`,
+          [a.id, booth.wardId],
+        );
         changed.push(`-${a.id}`);
       }
     }

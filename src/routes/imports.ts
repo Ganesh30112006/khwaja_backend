@@ -23,12 +23,21 @@ interface ImportResult {
   errors: { rowNumber: number; message: string }[];
 }
 
-/** Existing voter IDs and household wards so the browser can flag duplicates before uploading. */
-importsRouter.get('/imports/context', async (_req, res) => {
-  const ids = (await pool.query<{ id: string }>('SELECT upper(voter_id) AS id FROM voters ORDER BY record_id')).rows;
+/**
+ * Existing voter IDs and household wards so the browser can flag duplicates before uploading. A
+ * Corporator gets only its own wards; the server still rejects duplicates of voters elsewhere.
+ */
+importsRouter.get('/imports/context', async (req, res) => {
+  const admin = auth(req).admin;
+  const wards = admin.role === 'SUPER_ADMIN' ? null : admin.wardIds;
+  const ids = (await pool.query<{ id: string }>(
+    'SELECT upper(voter_id) AS id FROM voters WHERE $1::text[] IS NULL OR ward_id = ANY($1) ORDER BY record_id',
+    [wards],
+  )).rows;
   const households = (await pool.query<{ key: string; wardId: string }>(
     `SELECT DISTINCT ON (upper(household_id)) upper(household_id) AS key, ward_id AS "wardId"
-     FROM voters WHERE household_id <> '' ORDER BY upper(household_id), record_id DESC`,
+     FROM voters WHERE household_id <> '' AND ($1::text[] IS NULL OR ward_id = ANY($1)) ORDER BY upper(household_id), record_id DESC`,
+    [wards],
   )).rows;
   res.json({ existingVoterIds: ids.map((r) => r.id), households: households.map((h) => [h.key, h.wardId]) });
 });
@@ -75,7 +84,7 @@ importsRouter.post('/imports/:id/rows', async (req, res) => {
       const outcome = await withTransaction(async (db) => {
         const existing = row.replace === true ? await findVoterByVoterId(db, String(body.voterId ?? ''), true) : undefined;
         if (existing && !ownsWard(admin, existing.wardId)) {
-          fail(403, 'FORBIDDEN', `This voter is in ward ${wardNumbers.get(existing.wardId) ?? '?'}, which is not assigned to you.`);
+          fail(403, 'FORBIDDEN', 'This Voter ID belongs to a voter outside your wards.');
         }
         const input = await validateVoterInput(db, refs, body, existing?.recordId);
         if (!ownsWard(admin, input.wardId)) fail(403, 'FORBIDDEN', `Ward ${wardNumbers.get(input.wardId) ?? '?'} is not assigned to you.`);
