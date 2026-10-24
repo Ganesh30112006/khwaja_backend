@@ -4,7 +4,7 @@ import { assertOwnWard, ownsWard } from '../lib/admins.js';
 import { addAudit } from '../lib/audit.js';
 import { fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
-import { str, strArray } from '../lib/validation.js';
+import { formatInr, isValidAmount, str, strArray } from '../lib/validation.js';
 import { auth, authenticate, requireSuper, requireWardManager } from '../middleware/auth.js';
 import { trimBlosToCorporator } from './admins.js';
 
@@ -75,8 +75,8 @@ wardsRouter.get('/wards', authenticate, async (_req, res) => {
 /** Wards with their booths, voter counts and assigned accounts. A Corporator sees only its own wards. */
 wardsRouter.get('/wards/summary', authenticate, requireWardManager, async (req, res) => {
   const actor = auth(req).admin;
-  const wards = (await pool.query<Ward & { voterCount: number; adminIds: string[] }>(
-    `SELECT w.id, w.number, w.name,
+  const wards = (await pool.query<Ward & { paymentAmount: number | null; voterCount: number; adminIds: string[] }>(
+    `SELECT w.id, w.number, w.name, w.payment_amount AS "paymentAmount",
        (SELECT count(*) FROM voters v WHERE v.ward_id = w.id) AS "voterCount",
        COALESCE((SELECT array_agg(a.id ORDER BY split_part(a.id, '-', 2)::int) FROM admin_wards aw JOIN admins a ON a.id = aw.admin_id
                  WHERE aw.ward_id = w.id AND a.role = 'CORPORATOR'), '{}') AS "adminIds"
@@ -118,6 +118,31 @@ wardsRouter.put('/wards/:id', authenticate, requireSuper, async (req, res) => {
     return { id: current.id, ...clean };
   });
   res.json(ward);
+});
+
+/**
+ * A ward's own payment amount for every voter in it (null = use the overall amount). Set by the ward's
+ * Corporator or a Super Admin; applies to new payments only.
+ */
+wardsRouter.put('/wards/:id/payment-amount', authenticate, requireWardManager, async (req, res) => {
+  const actor = auth(req).admin;
+  const raw = req.body?.amount;
+  const amount = raw === null || raw === '' ? null : Number(raw);
+  if (amount !== null && !isValidAmount(amount)) fail(400, 'VALIDATION', 'Enter a valid amount.', { amount: 'Enter a whole amount between ₹1 and ₹1,00,000' });
+  const result = await withTransaction(async (db) => {
+    const ward = (await db.query<{ id: string; number: number; paymentAmount: number | null }>(
+      'SELECT id, number, payment_amount AS "paymentAmount" FROM wards WHERE id = $1 FOR UPDATE',
+      [str(req.params.id)],
+    )).rows[0];
+    if (!ward || !ownsWard(actor, ward.id)) fail(404, 'NOT_FOUND', 'Ward not found.');
+    if (ward.paymentAmount !== amount) {
+      await db.query('UPDATE wards SET payment_amount = $1 WHERE id = $2', [amount, ward.id]);
+      const label = (n: number | null) => (n === null ? 'overall amount' : formatInr(n));
+      await addAudit(db, actor, 'Ward payment amount changed', 'Ward', ward.id, `Ward ${ward.number}: ${label(ward.paymentAmount)} → ${label(amount)}`);
+    }
+    return { id: ward.id, paymentAmount: amount };
+  });
+  res.json(result);
 });
 
 wardsRouter.post('/booths', authenticate, requireWardManager, async (req, res) => {

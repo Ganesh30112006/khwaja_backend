@@ -268,7 +268,7 @@ describe('payments', () => {
     expect(Object.keys(bad.fieldErrors).sort()).toEqual(['amount', 'givenByName', 'receiverMobile', 'receiverName']);
     await expectStatus(call('put', '/settings/payment', sa, { defaultAmount: 1500, effectiveDate: '2000-01-01', allowAmountOverride: false }), 200);
     const c1 = await login(C1_MOBILE);
-    expect(await expectStatus(call('get', '/payments/context', c1), 200)).toEqual({ suggestedAmount: 1500, amountEditable: false });
+    expect(await expectStatus(call('get', '/payments/context', c1), 200)).toEqual({ suggestedAmount: 1500, amountEditable: false, defaultAmount: 1500, wardAmounts: [] });
     const err = await expectStatus(call('post', '/payments', c1, { ...pay((await notReceivedVoter(c1)).recordId, 'amt'), amount: 9999 }), 400);
     expect(err.fieldErrors.amount).toBe('Amount must be ₹1,500');
   });
@@ -662,6 +662,58 @@ describe('wards, reports and audit', () => {
     const report = await expectStatus(call('get', '/reports', sa), 200);
     expect(report.summary.transactions).toBe(report.byAdmin.reduce((s: number, a: { transactions: number }) => s + a.transactions, 0));
     expect(report.daily.reduce((s: number, d: { amount: number }) => s + d.amount, 0)).toBe(report.summary.amount);
+  });
+
+  it('lets a Corporator set the payment amount for its own wards', async () => {
+    const c1 = await login(C1_MOBILE);
+    const blo = await login(BLO_MOBILE);
+    const amount = (await expectStatus(call('get', '/payments/context', blo), 200)).defaultAmount;
+    expect(await expectStatus(call('put', '/wards/W1/payment-amount', c1, { amount: 2500 }), 200)).toEqual({ id: 'W1', paymentAmount: 2500 });
+    // Not its ward, BLOs cannot set it, and the amount must be valid.
+    await expectStatus(call('put', '/wards/W3/payment-amount', c1, { amount: 2500 }), 404);
+    await expectStatus(call('put', '/wards/W1/payment-amount', blo, { amount: 100 }), 403);
+    await expectStatus(call('put', '/wards/W1/payment-amount', c1, { amount: 0 }), 400);
+
+    // Voters in ward 1 get the ward amount; other wards keep the overall amount.
+    expect(await expectStatus(call('get', '/payments/context', blo, undefined, { wardId: 'W1' }), 200)).toMatchObject({ suggestedAmount: 2500, wardAmounts: [{ wardId: 'W1', amount: 2500 }] });
+    const c2ctx = await expectStatus(call('get', '/payments/context', await login(C2_MOBILE), undefined, { wardId: 'W1' }), 200);
+    expect(c2ctx).toMatchObject({ suggestedAmount: amount, wardAmounts: [] });
+    const target = await notReceivedVoter(blo);
+    const fixed = !(await expectStatus(call('get', '/payments/context', blo), 200)).amountEditable;
+    if (fixed) expect((await expectStatus(call('post', '/payments', blo, { ...pay(target.recordId, 'w1'), amount }), 400)).fieldErrors.amount).toContain('2,500');
+    expect(await expectStatus(call('post', '/payments', blo, { ...pay(target.recordId, 'w2'), amount: 2500 }), 201)).toMatchObject({ amount: 2500 });
+    const summary = await expectStatus(call('get', '/wards/summary', c1), 200);
+    expect(summary.map((w: { paymentAmount: number | null }) => w.paymentAmount)).toEqual([2500, null]);
+
+    // Clearing it goes back to the overall amount.
+    await expectStatus(call('put', '/wards/W1/payment-amount', c1, { amount: null }), 200);
+    expect((await expectStatus(call('get', '/payments/context', blo, undefined, { wardId: 'W1' }), 200)).suggestedAmount).toBe(amount);
+    const audit = await pool.query(`SELECT summary FROM audit_logs WHERE action = 'Ward payment amount changed' ORDER BY seq`);
+    expect(audit.rows.map((r) => r.summary)).toEqual(['Ward 1: overall amount → ₹2,500', 'Ward 1: ₹2,500 → overall amount']);
+  });
+
+  it('totals the money each BLO gave out: every BLO for the Super Admin, own BLOs for a Corporator', async () => {
+    type Blo = { adminId: string; corporatorId: string; transactions: number; amount: number };
+    const sa = await login(SUPER_MOBILE);
+    const all: Blo[] = (await expectStatus(call('get', '/reports', sa), 200)).byBlo;
+    expect(all.map((b) => b.adminId)).toEqual(['C-1-BLO1', 'C-1-BLO2', 'C-2-BLO1', 'C-3-BLO1']);
+    // Same numbers as the payments table (a BLO with none shows 0).
+    const { rows } = await pool.query<{ id: string; n: number; amount: number }>(
+      `SELECT a.id, count(t.id)::int AS n, COALESCE(sum(t.amount), 0)::int AS amount FROM admins a
+       LEFT JOIN payment_transactions t ON t.admin_id = a.id AND t.status = 'Success' WHERE a.role = 'BLO' GROUP BY a.id`,
+    );
+    for (const b of all) expect(rows.find((r) => r.id === b.adminId)).toMatchObject({ n: b.transactions, amount: b.amount });
+
+    const target = await notReceivedVoter(await login(BLO_MOBILE));
+    await expectStatus(call('post', '/payments', await login(BLO_MOBILE), pay(target.recordId, 'blo-total')), 201);
+    const c1: Blo[] = (await expectStatus(call('get', '/reports', await login(C1_MOBILE)), 200)).byBlo;
+    expect(c1.map((b) => b.adminId)).toEqual(['C-1-BLO1', 'C-1-BLO2']);
+    const before = all.find((b) => b.adminId === 'C-1-BLO1')!;
+    expect(c1[0]).toMatchObject({ corporatorId: 'C-1', transactions: before.transactions + 1, amount: before.amount + 2000 });
+    expect((await expectStatus(call('get', '/reports', await login(BLO_MOBILE)), 200)).byBlo).toEqual([]);
+    // A ward filter lists only the BLOs working there.
+    const w3: Blo[] = (await expectStatus(call('get', '/reports', sa, undefined, { wardId: 'W3' }), 200)).byBlo;
+    expect(w3.map((b) => b.adminId)).toEqual(['C-2-BLO1']);
   });
 
   it('keeps the audit log append-only and readable by the Super Admin only', async () => {

@@ -14,13 +14,22 @@ import { loadVoter } from '../services/voters.js';
 export const paymentsRouter = Router();
 paymentsRouter.use('/payments', authenticate);
 
-async function paymentContext(db: Db) {
+/**
+ * The amount to pay: a ward's own amount (set by its Corporator or a Super Admin) when it has one,
+ * otherwise the overall amount from payment settings. Lists the own amounts of wards in the caller's area.
+ */
+async function paymentContext(db: Db, admin: Admin, wardId = '') {
   const settings = await loadSettings(db);
-  return { suggestedAmount: await currentAmount(db, settings), amountEditable: settings.allowAmountOverride };
+  const defaultAmount = await currentAmount(db, settings);
+  const wardAmounts = (await db.query<{ wardId: string; amount: number }>(
+    'SELECT id AS "wardId", payment_amount AS amount FROM wards WHERE payment_amount IS NOT NULL ORDER BY number',
+  )).rows.filter((w) => admin.role === 'SUPER_ADMIN' || admin.wardIds.includes(w.wardId));
+  const suggestedAmount = wardAmounts.find((w) => w.wardId === wardId)?.amount ?? defaultAmount;
+  return { suggestedAmount, amountEditable: settings.allowAmountOverride, defaultAmount, wardAmounts };
 }
 
-paymentsRouter.get('/payments/context', async (_req, res) => {
-  res.json(await paymentContext(pool));
+paymentsRouter.get('/payments/context', async (req, res) => {
+  res.json(await paymentContext(pool, auth(req).admin, str(req.query.wardId)));
 });
 
 async function findReplay(db: Db, adminId: string, key: string): Promise<PaymentTransaction | undefined> {
@@ -60,7 +69,7 @@ paymentsRouter.post('/payments', async (req, res) => {
     if (!isValidIndianMobile(receiverMobile)) errors.receiverMobile = 'Enter a valid 10-digit Indian mobile number';
     if (givenByName.length < 2) errors.givenByName = 'Enter the name of the person giving the money';
     else if (givenByName.length > 100) errors.givenByName = 'Name is too long';
-    const ctx = await paymentContext(db);
+    const ctx = await paymentContext(db, admin, voter.wardId);
     if (!errors.amount && !ctx.amountEditable && amount !== ctx.suggestedAmount) errors.amount = `Amount must be ${formatInr(ctx.suggestedAmount)}`;
     failIfErrors(errors);
 

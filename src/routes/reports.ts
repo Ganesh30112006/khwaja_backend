@@ -155,6 +155,37 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
   return { byWard, byBooth, byAdmin, daily, totals };
 }
 
+interface BloRow extends AdminRow {
+  corporatorId: string;
+  status: string;
+}
+
+/**
+ * Money given out by each BLO (Super Admin: every BLO; Corporator: its own BLOs; BLO: none), so BLOs
+ * with no payments still show. With a ward filter, only BLOs on that ward or with payments there are listed.
+ */
+async function bloTotals(admin: Admin, scope: Scope, f: Filters): Promise<BloRow[]> {
+  if (admin.role === 'BLO') return [];
+  const p = new Params();
+  const tx = `SELECT t.admin_id, t.voter_record_id, t.amount FROM payment_transactions t JOIN voters v ON v.record_id = t.voter_record_id
+              WHERE ${voterWhere(scope, f, p)} AND ${txWhere(admin, f, p)}`;
+  const where = [`a.role = 'BLO'`];
+  if (admin.role === 'CORPORATOR') where.push(`a.corporator_id = ${p.add(admin.id)}`);
+  if (f.adminId && admin.role === 'SUPER_ADMIN') where.push(`a.id = ${p.add(f.adminId)}`);
+  if (f.wardId) where.push(`(EXISTS (SELECT 1 FROM admin_wards aw WHERE aw.admin_id = a.id AND aw.ward_id = ${p.add(f.wardId)}) OR EXISTS (SELECT 1 FROM tx WHERE tx.admin_id = a.id))`);
+  return (await pool.query<BloRow>(
+    `WITH tx AS (${tx})
+     SELECT a.id AS "adminId", a.full_name AS "adminName", a.corporator_id AS "corporatorId", a.status,
+       count(tx.admin_id)::int AS transactions, COALESCE(sum(tx.amount), 0)::int AS amount,
+       count(DISTINCT tx.voter_record_id)::int AS "uniqueVoters"
+     FROM admins a LEFT JOIN tx ON tx.admin_id = a.id
+     WHERE ${where.join(' AND ')}
+     GROUP BY a.id
+     ORDER BY substring(a.id from '^C-([0-9]+)')::int, substring(a.id from 'BLO([0-9]+)$')::int`,
+    p.values,
+  )).rows;
+}
+
 reportsRouter.get('/reports/dashboard', authenticate, async (req, res) => {
   const { admin, scope } = auth(req);
   const isSuper = admin.role === 'SUPER_ADMIN';
@@ -249,6 +280,7 @@ reportsRouter.get('/reports', authenticate, async (req, res) => {
     byBooth,
     // Super Admin: everyone. Corporator: itself and its BLOs. BLO: itself.
     byAdmin: byAdmin.filter((a) => admin.role === 'SUPER_ADMIN' || a.adminId === admin.id || (admin.role === 'CORPORATOR' && a.adminId.startsWith(`${admin.id}-BLO`))),
+    byBlo: await bloTotals(admin, scope, f),
     daily,
     monthly,
   });
