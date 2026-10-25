@@ -191,6 +191,17 @@ adminsRouter.get('/admins/:id', async (req, res) => {
   res.json(await loadManaged(pool, auth(req).admin, str(req.params.id)));
 });
 
+/** Money an account has given out (successful payments), for accounts the caller manages. */
+adminsRouter.get('/admins/:id/payment-totals', async (req, res) => {
+  const target = await loadManaged(pool, auth(req).admin, str(req.params.id));
+  const { rows } = await pool.query<{ transactions: number; amount: number }>(
+    `SELECT count(*)::int AS transactions, COALESCE(sum(amount), 0)::int AS amount
+     FROM payment_transactions WHERE admin_id = $1 AND status = 'Success'`,
+    [target.id],
+  );
+  res.json(rows[0]);
+});
+
 adminsRouter.post('/admins', passwordWriteLimiter, async (req, res) => {
   const actor = auth(req).admin;
   const body = req.body ?? {};

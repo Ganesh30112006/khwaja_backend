@@ -643,8 +643,28 @@ describe('wards, reports and audit', () => {
     await expectStatus(call('post', '/booths', sa, { wardId: ward.id, number: 61, name: 'Dup' }), 400);
     const moved = await expectStatus(call('put', `/booths/${booth.id}`, sa, { number: 62, name: 'Renamed', wardId: 'W1' }), 200);
     expect(moved).toMatchObject({ wardId: ward.id, number: 62 });
-    const list = await expectStatus(call('get', '/wards', await login(BLO_MOBILE)), 200);
-    expect(list.wards.map((w: { number: number }) => w.number)).toEqual([1, 2, 3, 4, 5, 6]);
+    const all = await expectStatus(call('get', '/wards', sa), 200);
+    expect(all.wards.map((w: { number: number }) => w.number)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it('shows Corporators and BLOs only their own wards and booths', async () => {
+    const c1 = await expectStatus(call('get', '/wards', await login(C1_MOBILE)), 200);
+    expect(c1.wards.map((w: { id: string }) => w.id)).toEqual(['W1', 'W2']);
+    expect(c1.booths.every((b: { wardId: string }) => ['W1', 'W2'].includes(b.wardId))).toBe(true);
+    const blo = await expectStatus(call('get', '/wards', await login(BLO_MOBILE)), 200);
+    expect(blo.wards.map((w: { id: string }) => w.id)).toEqual(['W1']);
+    expect(blo.booths.map((b: { id: string }) => b.id).sort()).toEqual(['B1-1', 'B1-2']);
+  });
+
+  it('shows the Super Admin and its Corporator how much a BLO has given out', async () => {
+    const blo = await login(BLO_MOBILE);
+    const before = await expectStatus(call('get', '/admins/C-1-BLO1/payment-totals', await login(C1_MOBILE)), 200);
+    const target = await notReceivedVoter(blo);
+    await expectStatus(call('post', '/payments', blo, pay(target.recordId, 'tot1')), 201);
+    expect(await expectStatus(call('get', '/admins/C-1-BLO1/payment-totals', await login(SUPER_MOBILE)), 200)).toEqual({ transactions: before.transactions + 1, amount: before.amount + 2000 });
+    // Another Corporator and the BLO itself cannot see it.
+    await expectStatus(call('get', '/admins/C-1-BLO1/payment-totals', await login(C2_MOBILE)), 404);
+    expect([403, 404]).toContain((await call('get', '/admins/C-1-BLO1/payment-totals', blo)).status);
   });
 
   it('scopes dashboards and reports to the account area', async () => {

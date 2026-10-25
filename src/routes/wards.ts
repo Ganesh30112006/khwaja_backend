@@ -1,6 +1,6 @@
 import { Router } from 'express';
-import { isUniqueViolation, pool, withTransaction, type Db } from '../db/pool.js';
-import { assertOwnWard, ownsWard } from '../lib/admins.js';
+import { isUniqueViolation, Params, pool, withTransaction, type Db } from '../db/pool.js';
+import { assertOwnWard, coversSql, ownsWard } from '../lib/admins.js';
 import { addAudit } from '../lib/audit.js';
 import { fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
@@ -65,10 +65,22 @@ async function wardNumber(db: Db, id: string): Promise<number> {
   return (await db.query<{ number: number }>('SELECT number FROM wards WHERE id = $1', [id])).rows[0]?.number ?? 0;
 }
 
-/** Wards and booths are readable by every admin (filters, forms, labels). */
-wardsRouter.get('/wards', authenticate, async (_req, res) => {
-  const wards = (await pool.query<Ward>('SELECT id, number, name FROM wards ORDER BY number')).rows;
-  const booths = (await pool.query<Booth>(`SELECT ${BOOTH_COLUMNS} FROM booths ORDER BY number, id`)).rows;
+/**
+ * Wards and booths for filters, forms and labels: every one for the Super Admin, otherwise only the
+ * caller's own wards and the booths it covers (other wards are never shown).
+ */
+wardsRouter.get('/wards', authenticate, async (req, res) => {
+  const { admin, scope } = auth(req);
+  const all = admin.role === 'SUPER_ADMIN';
+  const wards = (await pool.query<Ward>(
+    'SELECT id, number, name FROM wards WHERE $1::text[] IS NULL OR id = ANY($1) ORDER BY number',
+    [all ? null : admin.wardIds],
+  )).rows;
+  const p = new Params();
+  const booths = (await pool.query<Booth>(
+    `SELECT ${BOOTH_COLUMNS} FROM booths WHERE ${coversSql(scope, (v) => p.add(v), 'ward_id', 'id')} ORDER BY number, id`,
+    p.values,
+  )).rows;
   res.json({ wards, booths });
 });
 
