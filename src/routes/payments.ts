@@ -10,6 +10,7 @@ import { formatInr, isValidAmount, isValidDate, isValidIndianMobile, likePattern
 import { auth, authenticate, requireWardManager } from '../middleware/auth.js';
 import { cleanTxn, currentAmount, hideSuperAdmin, loadSettings, TXN_COLUMNS, TXN_SELECT, txnFor, type PaymentTransaction } from '../services/payments.js';
 import { loadVoter } from '../services/voters.js';
+import { bloCashSummary } from './cash.js';
 
 export const paymentsRouter = Router();
 paymentsRouter.use('/payments', authenticate);
@@ -25,7 +26,9 @@ async function paymentContext(db: Db, admin: Admin, wardId = '') {
     'SELECT id AS "wardId", payment_amount AS amount FROM wards WHERE payment_amount IS NOT NULL ORDER BY number',
   )).rows.filter((w) => admin.role === 'SUPER_ADMIN' || admin.wardIds.includes(w.wardId));
   const suggestedAmount = wardAmounts.find((w) => w.wardId === wardId)?.amount ?? defaultAmount;
-  return { suggestedAmount, amountEditable: settings.allowAmountOverride, defaultAmount, wardAmounts };
+  // A BLO pays out of the cash its Corporator gave it.
+  const cashLeft = admin.role === 'BLO' ? (await bloCashSummary(db, admin.id)).left : null;
+  return { suggestedAmount, amountEditable: settings.allowAmountOverride, defaultAmount, wardAmounts, cashLeft };
 }
 
 paymentsRouter.get('/payments/context', async (req, res) => {

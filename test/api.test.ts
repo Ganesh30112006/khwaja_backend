@@ -268,7 +268,7 @@ describe('payments', () => {
     expect(Object.keys(bad.fieldErrors).sort()).toEqual(['amount', 'givenByName', 'receiverMobile', 'receiverName']);
     await expectStatus(call('put', '/settings/payment', sa, { defaultAmount: 1500, effectiveDate: '2000-01-01', allowAmountOverride: false }), 200);
     const c1 = await login(C1_MOBILE);
-    expect(await expectStatus(call('get', '/payments/context', c1), 200)).toEqual({ suggestedAmount: 1500, amountEditable: false, defaultAmount: 1500, wardAmounts: [] });
+    expect(await expectStatus(call('get', '/payments/context', c1), 200)).toEqual({ suggestedAmount: 1500, amountEditable: false, defaultAmount: 1500, wardAmounts: [], cashLeft: null });
     const err = await expectStatus(call('post', '/payments', c1, { ...pay((await notReceivedVoter(c1)).recordId, 'amt'), amount: 9999 }), 400);
     expect(err.fieldErrors.amount).toBe('Amount must be ₹1,500');
   });
@@ -654,6 +654,36 @@ describe('wards, reports and audit', () => {
     const blo = await expectStatus(call('get', '/wards', await login(BLO_MOBILE)), 200);
     expect(blo.wards.map((w: { id: string }) => w.id)).toEqual(['W1']);
     expect(blo.booths.map((b: { id: string }) => b.id).sort()).toEqual(['B1-1', 'B1-2']);
+  });
+
+  it('tracks the cash a Corporator gives each BLO and what the BLO has left', async () => {
+    const c1 = await login(C1_MOBILE);
+    const blo = await login(BLO_MOBILE);
+    const start = await expectStatus(call('get', '/cash/C-1-BLO1', blo), 200);
+    expect(start.given).toBe(0);
+    expect(start.left).toBe(-start.spent);
+
+    const after = await expectStatus(call('post', '/cash/C-1-BLO1', c1, { amount: 10000, note: 'First bundle' }), 201);
+    expect(after).toMatchObject({ given: 10000, left: 10000 - start.spent, history: [{ amount: 10000, note: 'First bundle', givenBy: 'C-1' }] });
+    // A payment by the BLO comes out of what it has left.
+    const target = await notReceivedVoter(blo);
+    await expectStatus(call('post', '/payments', blo, pay(target.recordId, 'cash1')), 201);
+    expect((await expectStatus(call('get', '/payments/context', blo), 200)).cashLeft).toBe(10000 - start.spent - 2000);
+    const sa = await login(SUPER_MOBILE);
+    expect(await expectStatus(call('get', '/cash/C-1-BLO1', sa), 200)).toMatchObject({ given: 10000, spent: start.spent + 2000 });
+    const row = (await expectStatus(call('get', '/reports', c1), 200)).byBlo.find((b: { adminId: string }) => b.adminId === 'C-1-BLO1');
+    expect(row).toMatchObject({ cashGiven: 10000, cashLeft: 10000 - start.spent - 2000 });
+
+    // Taking money back, but never more than was given.
+    expect((await expectStatus(call('post', '/cash/C-1-BLO1', c1, { amount: -4000 }), 201)).given).toBe(6000);
+    await expectStatus(call('post', '/cash/C-1-BLO1', c1, { amount: -6001 }), 400);
+    await expectStatus(call('post', '/cash/C-1-BLO1', c1, { amount: 0 }), 400);
+    // Only the BLO's own Corporator changes it; other accounts cannot even see it.
+    await expectStatus(call('post', '/cash/C-1-BLO1', sa, { amount: 100 }), 403);
+    await expectStatus(call('post', '/cash/C-1-BLO1', blo, { amount: 100 }), 403);
+    await expectStatus(call('get', '/cash/C-1-BLO1', await login(C2_MOBILE)), 404);
+    await expectStatus(call('get', '/cash/C-1-BLO2', blo), 404);
+    await expectStatus(call('get', '/cash/C-1', c1), 404);
   });
 
   it('shows the Super Admin and its Corporator how much a BLO has given out', async () => {

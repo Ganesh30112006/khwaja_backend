@@ -8,6 +8,7 @@ import { pool } from './db/pool.js';
 import { ApiError } from './lib/errors.js';
 import { adminsRouter } from './routes/admins.js';
 import { authRouter } from './routes/auth.js';
+import { cashRouter } from './routes/cash.js';
 import { importsRouter } from './routes/imports.js';
 import { paymentsRouter } from './routes/payments.js';
 import { reportsRouter } from './routes/reports.js';
@@ -42,7 +43,7 @@ export function createApp() {
   }
 
   const api = express.Router();
-  for (const router of [authRouter, adminsRouter, wardsRouter, votersRouter, importsRouter, paymentsRouter, settingsRouter, reportsRouter]) api.use(router);
+  for (const router of [authRouter, adminsRouter, wardsRouter, votersRouter, importsRouter, paymentsRouter, settingsRouter, reportsRouter, cashRouter]) api.use(router);
   app.use('/api', api);
 
   app.use((_req, res) => {

@@ -158,6 +158,9 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
 interface BloRow extends AdminRow {
   corporatorId: string;
   status: string;
+  /** All-time cash given by the Corporator and what is left after all successful payments. */
+  cashGiven: number;
+  cashLeft: number;
 }
 
 /**
@@ -177,7 +180,10 @@ async function bloTotals(admin: Admin, scope: Scope, f: Filters): Promise<BloRow
     `WITH tx AS (${tx})
      SELECT a.id AS "adminId", a.full_name AS "adminName", a.corporator_id AS "corporatorId", a.status,
        count(tx.admin_id)::int AS transactions, COALESCE(sum(tx.amount), 0)::int AS amount,
-       count(DISTINCT tx.voter_record_id)::int AS "uniqueVoters"
+       count(DISTINCT tx.voter_record_id)::int AS "uniqueVoters",
+       COALESCE((SELECT sum(c.amount) FROM blo_cash c WHERE c.blo_id = a.id), 0)::int AS "cashGiven",
+       (COALESCE((SELECT sum(c.amount) FROM blo_cash c WHERE c.blo_id = a.id), 0)
+        - COALESCE((SELECT sum(t.amount) FROM payment_transactions t WHERE t.admin_id = a.id AND t.status = 'Success'), 0))::int AS "cashLeft"
      FROM admins a LEFT JOIN tx ON tx.admin_id = a.id
      WHERE ${where.join(' AND ')}
      GROUP BY a.id
