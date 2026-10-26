@@ -17,7 +17,7 @@ function mulberry32(seed: number) {
 const FIRST = ['Ravi', 'Lakshmi', 'Suresh', 'Anitha', 'Mohan', 'Priya', 'Karthik', 'Divya', 'Ganesh', 'Meena', 'Arjun', 'Kavya', 'Rajesh', 'Sita', 'Vijay', 'Pooja', 'Naveen', 'Revathi', 'Prakash', 'Swathi', 'Imran', 'Fathima', 'Joseph', 'Mary'];
 const LAST = ['Kumar', 'Reddy', 'Sharma', 'Naidu', 'Rao', 'Patel', 'Iyer', 'Pillai', 'Khan', 'Das', 'Singh', 'Varma', 'Chowdary', 'Nair'];
 const STREETS = ['Gandhi Road', 'Market Street', 'Temple Street', 'Lake View Road', 'Station Road', 'Nehru Nagar', 'MG Road'];
-const STATUSES = ['Active', 'Active', 'Active', 'Active', 'Active', 'Active', 'Not Active', 'Shifted'] as const;
+const STATUSES = ['Active', 'Active', 'Active', 'Active', 'Active', 'Active', 'Dead', 'Shifted'] as const;
 
 interface SeedAdmin {
   id: string;

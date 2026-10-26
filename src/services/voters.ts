@@ -62,7 +62,8 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   const address = str(body.address).trim();
   const wardId = str(body.wardId);
   const boothId = str(body.boothId);
-  const status = body.status as VoterStatus;
+  // "Not Active" was the old name of Dead.
+  const status = (body.status === 'Not Active' ? 'Dead' : body.status) as VoterStatus;
   const ageRaw = body.age === null || body.age === undefined ? '' : String(body.age).trim();
   const age = ageRaw === '' ? null : Number(ageRaw);
   const gender = str(body.gender) as Gender;
@@ -102,7 +103,7 @@ export function voterIdConflict(): ApiError {
 
 /**
  * Adds payment status. A voter has at most one successful payment; lists only hold voters in the admin's area.
- * Active voters can be paid; Shifted voters too, but a BLO needs its Corporator's permission; Not Active never.
+ * Active voters can be paid; Shifted voters too, but a BLO needs its Corporator's permission; Dead never.
  */
 export async function toListItems(db: Db, scope: Scope, voters: Voter[], role: Admin['role']): Promise<VoterListItem[]> {
   const ids = voters.map((v) => v.recordId);

@@ -34,7 +34,7 @@ interface GroupRow {
   label: string;
   voters: number;
   active: number;
-  notActive: number;
+  dead: number;
   shifted: number;
   received: number;
   notReceived: number;
@@ -77,14 +77,14 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
   const vw = voterWhere(scope, f, p);
   const tw = txWhere(admin, f, p);
   const cells = (await pool.query<{
-    wardId: string; boothId: string; voters: number; active: number; notActive: number; shifted: number; received: number; transactions: number; amount: number;
+    wardId: string; boothId: string; voters: number; active: number; dead: number; shifted: number; received: number; transactions: number; amount: number;
   }>(
     `WITH sv AS (SELECT v.record_id, v.ward_id, v.booth_id, v.status FROM voters v WHERE ${vw}),
           tx AS (SELECT t.voter_record_id, t.amount FROM payment_transactions t JOIN sv ON sv.record_id = t.voter_record_id WHERE ${tw}),
           vt AS (SELECT voter_record_id, count(*) AS n, sum(amount) AS amount FROM tx GROUP BY voter_record_id)
      SELECT sv.ward_id AS "wardId", COALESCE(sv.booth_id, '') AS "boothId", count(*)::int AS voters,
        count(*) FILTER (WHERE sv.status = 'Active')::int AS active,
-       count(*) FILTER (WHERE sv.status = 'Not Active')::int AS "notActive",
+       count(*) FILTER (WHERE sv.status = 'Dead')::int AS "dead",
        count(*) FILTER (WHERE sv.status = 'Shifted')::int AS shifted,
        count(vt.voter_record_id)::int AS received,
        COALESCE(sum(vt.n), 0)::int AS transactions,
@@ -98,7 +98,7 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
   const booths = (await pool.query<{ id: string; number: number }>('SELECT id, number FROM booths')).rows;
   const wardNo = new Map(wards.map((w) => [w.id, w.number]));
   const boothNo = new Map(booths.map((b) => [b.id, b.number]));
-  const empty = (key: string, label: string): GroupRow => ({ key, label, voters: 0, active: 0, notActive: 0, shifted: 0, received: 0, notReceived: 0, transactions: 0, amount: 0 });
+  const empty = (key: string, label: string): GroupRow => ({ key, label, voters: 0, active: 0, dead: 0, shifted: 0, received: 0, notReceived: 0, transactions: 0, amount: 0 });
   const byWardMap = new Map<string, GroupRow>();
   const byBoothMap = new Map<string, GroupRow>();
   // Assigned/selected wards with no voters still appear, so charts show them.
@@ -114,7 +114,7 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
     for (const r of [w, b]) {
       r.voters += c.voters;
       r.active += c.active;
-      r.notActive += c.notActive;
+      r.dead += c.dead;
       r.shifted += c.shifted;
       r.received += c.received;
       r.notReceived += c.voters - c.received;
@@ -146,7 +146,7 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
   const totals = {
     totalVoters: sum('voters'),
     active: sum('active'),
-    notActive: sum('notActive'),
+    dead: sum('dead'),
     shifted: sum('shifted'),
     received: sum('received'),
     transactions: sum('transactions'),
@@ -241,7 +241,7 @@ reportsRouter.get('/reports/dashboard', authenticate, async (req, res) => {
     totalWards: byWard.length,
     totalBooths: isSuper ? counts.booths : byBooth.length,
     activeVoters: totals.active,
-    notActiveVoters: totals.notActive,
+    deadVoters: totals.dead,
     shiftedVoters: totals.shifted,
     votersReceived: totals.received,
     votersNotReceived: totals.totalVoters - totals.received,
@@ -275,7 +275,7 @@ reportsRouter.get('/reports', authenticate, async (req, res) => {
     summary: {
       totalVoters: totals.totalVoters,
       active: totals.active,
-      notActive: totals.notActive,
+      dead: totals.dead,
       shifted: totals.shifted,
       votersReceived: totals.received,
       votersNotReceived: totals.totalVoters - totals.received,

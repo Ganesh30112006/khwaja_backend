@@ -59,8 +59,8 @@ paymentsRouter.post('/payments', async (req, res) => {
     const replay = await findReplay(db, admin.id, key);
     if (replay) return { tx: replay, replay: true };
     if (!covers(scope, voter)) fail(403, 'FORBIDDEN', 'This voter is outside your assigned area.');
-    // Not Active voters (e.g. deceased) are never paid. Shifted voters are, but a BLO needs its Corporator's permission.
-    if (voter.status === 'Not Active') fail(409, 'CONFLICT', 'This voter is Not Active and cannot receive a payment.');
+    // Dead voters are never paid. Shifted voters are, but a BLO needs its Corporator's permission.
+    if (voter.status === 'Dead') fail(409, 'CONFLICT', 'This voter is Dead and cannot receive a payment.');
     if (voter.status === 'Shifted' && admin.role === 'BLO' && !(await isShiftedApproved(db, voter.recordId))) {
       fail(403, 'FORBIDDEN', 'This voter has shifted. Ask your Corporator for permission before paying.');
     }

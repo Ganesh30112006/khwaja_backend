@@ -71,12 +71,13 @@ votersRouter.get('/voters', authenticate, async (req, res) => {
 const MAX_STATUS_IDS = 1000;
 
 /**
- * Sets the status of many voters at once by Voter ID, e.g. from a list of deceased (Not Active) or shifted
+ * Sets the status of many voters at once by Voter ID, e.g. from a list of dead or shifted
  * voters. Voter IDs are matched ignoring case; unknown IDs are reported back, not created.
  */
 votersRouter.post('/voters/status', authenticate, requireWardManager, async (req, res) => {
   const actor = auth(req).admin;
-  const status = req.body?.status as VoterStatus;
+  // "Not Active" was the old name of Dead.
+  const status = (req.body?.status === 'Not Active' ? 'Dead' : req.body?.status) as VoterStatus;
   if (!VOTER_STATUSES.includes(status)) fail(400, 'VALIDATION', 'Select a voter status.', { status: 'Select a voter status' });
   const ids = [...new Set(strArray(req.body?.voterIds).map((id) => id.trim().toUpperCase()).filter(Boolean))];
   if (!ids.length) fail(400, 'VALIDATION', 'No voter IDs were sent.');

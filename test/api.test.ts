@@ -285,8 +285,10 @@ describe('payments', () => {
     const detail = await expectStatus(call('get', `/voters/${a.recordId}`, sa), 200);
     // Shifted voters can still be paid (a BLO needs permission, see the test above).
     expect(detail.voter).toMatchObject({ status: 'Shifted', canRecordPayment: true });
+    // Dead voters are never paid ("Not Active" is still accepted as the old name).
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [b.voterId], status: 'Not Active' }), 200);
-    await expectStatus(call('post', '/payments', sa, pay(b.recordId, 'deceased-pay')), 409);
+    expect((await expectStatus(call('get', `/voters/${b.recordId}`, sa), 200)).voter).toMatchObject({ status: 'Dead', canRecordPayment: false });
+    expect((await expectStatus(call('post', '/payments', sa, pay(b.recordId, 'deceased-pay')), 409)).message).toContain('Dead');
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Gone' }), 400);
     // C-2 covers ward 3 only: a voter in ward 1 is not changed and looks like it does not exist. BLOs cannot do this at all.
     const c2 = await expectStatus(call('post', '/voters/status', await login(C2_MOBILE), { voterIds: [a.voterId], status: 'Active' }), 200);

@@ -1,6 +1,6 @@
 /** Validation rules shared with the frontend (Frontend/src/utils/validation.ts). */
 
-export const VOTER_STATUSES = ['Active', 'Not Active', 'Shifted'] as const;
+export const VOTER_STATUSES = ['Active', 'Dead', 'Shifted'] as const;
 export type VoterStatus = (typeof VOTER_STATUSES)[number];
 
 /** '' when the roll does not say. */
