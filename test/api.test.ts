@@ -239,6 +239,42 @@ describe('payments', () => {
     expect(cancelled.status).toBe('Cancelled');
   });
 
+  it('Shifted voters can be paid, but a BLO needs its Corporator\'s permission first', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const c1 = await login(C1_MOBILE);
+    const blo = await login(BLO_MOBILE);
+    const [a, b, c] = await voters(blo, { paymentStatus: 'Not Received', status: 'Active', pageSize: 3 });
+    await expectStatus(call('post', '/voters/status', c1, { voterIds: [a.voterId, b.voterId, c.voterId], status: 'Shifted' }), 200);
+
+    // The BLO cannot pay yet; it asks, and the Corporator sees the request.
+    expect((await expectStatus(call('get', `/voters/${a.recordId}`, blo), 200)).voter).toMatchObject({ canRecordPayment: false, shiftedApproval: null });
+    expect((await expectStatus(call('post', '/payments', blo, pay(a.recordId, 'sh1')), 403)).message).toContain('permission');
+    expect(await expectStatus(call('post', `/voters/${a.recordId}/shifted-approval/request`, blo), 200)).toMatchObject({ status: 'Pending' });
+    const pending = await expectStatus(call('get', '/shifted-approvals', c1, undefined, { status: 'Pending' }), 200);
+    expect(pending).toEqual([expect.objectContaining({ recordId: a.recordId, requestedBy: 'C-1-BLO1', status: 'Pending' })]);
+    expect((await expectStatus(call('get', '/notifications', c1), 200))[0].title).toBe('Permission asked by C-1-BLO1');
+    await expectStatus(call('get', '/shifted-approvals', await login(C2_MOBILE)), 200).then((r) => expect(r).toEqual([]));
+    // Only the voter's Corporator (or a Super Admin) decides; never the BLO or another Corporator.
+    await expectStatus(call('post', `/voters/${a.recordId}/shifted-approval`, blo, { decision: 'Approved' }), 403);
+    await expectStatus(call('post', `/voters/${a.recordId}/shifted-approval`, await login(C2_MOBILE), { decision: 'Approved' }), 404);
+    await expectStatus(call('post', `/voters/${a.recordId}/shifted-approval`, c1, { decision: 'Approved' }), 200);
+    expect((await expectStatus(call('get', `/voters/${a.recordId}`, blo), 200)).voter).toMatchObject({ canRecordPayment: true, shiftedApproval: 'Approved' });
+    expect((await expectStatus(call('get', '/notifications', blo), 200)).some((n: { title: string }) => n.title === 'Permission given')).toBe(true);
+    await expectStatus(call('post', '/payments', blo, pay(a.recordId, 'sh2')), 201);
+
+    // A refused request keeps the BLO from paying; it may ask again.
+    await expectStatus(call('post', `/voters/${b.recordId}/shifted-approval/request`, blo), 200);
+    await expectStatus(call('post', `/voters/${b.recordId}/shifted-approval`, c1, { decision: 'Rejected' }), 200);
+    await expectStatus(call('post', '/payments', blo, pay(b.recordId, 'sh3')), 403);
+    expect(await expectStatus(call('post', `/voters/${b.recordId}/shifted-approval/request`, blo), 200)).toMatchObject({ status: 'Pending' });
+    // Corporators and Super Admins pay Shifted voters without asking.
+    await expectStatus(call('post', '/payments', c1, pay(b.recordId, 'sh4')), 201);
+    await expectStatus(call('post', '/payments', sa, pay(c.recordId, 'sh5')), 201);
+    // Asking only makes sense for Shifted voters.
+    const active = await notReceivedVoter(blo);
+    await expectStatus(call('post', `/voters/${active.recordId}/shifted-approval/request`, blo), 409);
+  });
+
   it('only Active voters can be paid; a deaths / shifted list updates statuses in bulk', async () => {
     const sa = await login(SUPER_MOBILE);
     const [a, b] = await voters(sa, { paymentStatus: 'Not Received', status: 'Active', wardId: 'W1', pageSize: 2 });
@@ -247,9 +283,8 @@ describe('payments', () => {
     const again = await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Shifted' }), 200);
     expect(again).toMatchObject({ updated: 0, unchanged: 1 });
     const detail = await expectStatus(call('get', `/voters/${a.recordId}`, sa), 200);
-    expect(detail.voter).toMatchObject({ status: 'Shifted', canRecordPayment: false });
-    const refused = await expectStatus(call('post', '/payments', sa, pay(a.recordId, 'shifted-pay')), 409);
-    expect(refused.message).toContain('Shifted');
+    // Shifted voters can still be paid (a BLO needs permission, see the test above).
+    expect(detail.voter).toMatchObject({ status: 'Shifted', canRecordPayment: true });
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [b.voterId], status: 'Not Active' }), 200);
     await expectStatus(call('post', '/payments', sa, pay(b.recordId, 'deceased-pay')), 409);
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Gone' }), 400);

@@ -59,13 +59,13 @@ function voterOrder(q: Request['query']): string {
 }
 
 votersRouter.get('/voters', authenticate, async (req, res) => {
-  const { scope } = auth(req);
+  const { admin, scope } = auth(req);
   const p = new Params();
   const filter = voterFilter(req.query, scope, p);
   const total = (await pool.query<{ n: number }>(`SELECT count(*) AS n ${FROM} ${filter}`, p.values)).rows[0].n;
   const win = pageWindow(total, req.query.page, req.query.pageSize);
   const voters = (await pool.query<Voter>(`SELECT ${VOTER_COLUMNS} ${FROM} ${filter} ${voterOrder(req.query)} LIMIT ${win.pageSize} OFFSET ${win.offset}`, p.values)).rows;
-  res.json({ items: await toListItems(pool, scope, voters), total, page: win.page, pageSize: win.pageSize });
+  res.json({ items: await toListItems(pool, scope, voters, admin.role), total, page: win.page, pageSize: win.pageSize });
 });
 
 const MAX_STATUS_IDS = 1000;
@@ -104,7 +104,7 @@ votersRouter.get('/voters/export', authenticate, requireWardManager, async (req,
   const { admin, scope } = auth(req);
   const p = new Params();
   const voters = (await pool.query<Voter>(`SELECT ${VOTER_COLUMNS} ${FROM} ${voterFilter(req.query, scope, p)} ${voterOrder(req.query)}`, p.values)).rows;
-  const items = await toListItems(pool, scope, voters);
+  const items = await toListItems(pool, scope, voters, admin.role);
   await addAudit(pool, admin, 'Voters exported', 'Export', 'voters', `${items.length} voter records`);
   res.json(items);
 });
@@ -139,10 +139,10 @@ votersRouter.get('/voters/duplicate-check', authenticate, requireWardManager, as
 });
 
 votersRouter.get('/voters/:recordId', authenticate, async (req, res) => {
-  const { scope } = auth(req);
+  const { admin, scope } = auth(req);
   const voter = await loadVoter(pool, str(req.params.recordId));
   if (!covers(scope, voter)) fail(404, 'NOT_FOUND', 'Voter not found.');
-  const [item] = await toListItems(pool, scope, [voter]);
+  const [item] = await toListItems(pool, scope, [voter], admin.role);
   const transactions = (await pool.query<PaymentTransaction>(`${TXN_SELECT} WHERE t.voter_record_id = $1 ORDER BY t."timestamp" DESC, t.id DESC`, [voter.recordId])).rows;
   res.json({ voter: item, transactions: transactions.map(txnFor(scope)) });
 });

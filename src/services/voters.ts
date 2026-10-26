@@ -1,5 +1,5 @@
 import { isUniqueViolation, type Db } from '../db/pool.js';
-import { covers, type Scope } from '../lib/admins.js';
+import { covers, type Admin, type Scope } from '../lib/admins.js';
 import { ApiError, fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
 import { GENDERS, HOUSEHOLD_ID_PATTERN, pad, str, VOTER_STATUSES, type Gender, type VoterStatus } from '../lib/validation.js';
@@ -31,6 +31,8 @@ export interface VoterListItem extends Voter {
   paymentStatus: 'Received' | 'Not Received';
   latestPayment: PaymentTransaction | null;
   canRecordPayment: boolean;
+  /** Permission for a BLO to pay a Shifted voter (null = never asked). */
+  shiftedApproval: 'Pending' | 'Approved' | 'Rejected' | null;
 }
 
 export const VOTER_COLUMNS = `v.record_id AS "recordId", v.voter_id AS "voterId", v.full_name AS "fullName",
@@ -98,20 +100,35 @@ export function voterIdConflict(): ApiError {
   return new ApiError(409, 'CONFLICT', 'A voter with this Voter ID already exists.', { voterId: 'This Voter ID already exists' });
 }
 
-/** Adds payment status. A voter has at most one successful payment; lists only hold voters in the admin's area. */
-export async function toListItems(db: Db, scope: Scope, voters: Voter[]): Promise<VoterListItem[]> {
+/**
+ * Adds payment status. A voter has at most one successful payment; lists only hold voters in the admin's area.
+ * Active voters can be paid; Shifted voters too, but a BLO needs its Corporator's permission; Not Active never.
+ */
+export async function toListItems(db: Db, scope: Scope, voters: Voter[], role: Admin['role']): Promise<VoterListItem[]> {
   const ids = voters.map((v) => v.recordId);
   const txs = ids.length
     ? (await db.query<PaymentTransaction>(`${TXN_SELECT} WHERE t.voter_record_id = ANY($1) AND t.status = 'Success'`, [ids])).rows.map(txnFor(scope))
     : [];
   const byVoter = new Map(txs.map((t) => [t.voterRecordId, t]));
+  const shiftedIds = voters.filter((v) => v.status === 'Shifted').map((v) => v.recordId);
+  const approvals = new Map(
+    shiftedIds.length
+      ? (await db.query<{ id: string; status: VoterListItem['shiftedApproval'] }>(
+          'SELECT voter_record_id AS id, status FROM shifted_approvals WHERE voter_record_id = ANY($1)',
+          [shiftedIds],
+        )).rows.map((r) => [r.id, r.status])
+      : [],
+  );
   return voters.map((v) => {
     const tx = byVoter.get(v.recordId) ?? null;
+    const shiftedApproval = v.status === 'Shifted' ? approvals.get(v.recordId) ?? null : null;
+    const payable = v.status === 'Active' || (v.status === 'Shifted' && (role !== 'BLO' || shiftedApproval === 'Approved'));
     return {
       ...v,
       paymentStatus: tx ? 'Received' : 'Not Received',
       latestPayment: tx,
-      canRecordPayment: !tx && v.status === 'Active' && covers(scope, v),
+      canRecordPayment: !tx && payable && covers(scope, v),
+      shiftedApproval,
     };
   });
 }

@@ -10,6 +10,7 @@ import { formatInr, isValidAmount, isValidDate, isValidIndianMobile, likePattern
 import { auth, authenticate, requireWardManager } from '../middleware/auth.js';
 import { cleanTxn, currentAmount, hideSuperAdmin, loadSettings, TXN_COLUMNS, TXN_SELECT, txnFor, type PaymentTransaction } from '../services/payments.js';
 import { loadVoter } from '../services/voters.js';
+import { isShiftedApproved } from './approvals.js';
 import { bloCashSummary } from './cash.js';
 
 export const paymentsRouter = Router();
@@ -58,8 +59,11 @@ paymentsRouter.post('/payments', async (req, res) => {
     const replay = await findReplay(db, admin.id, key);
     if (replay) return { tx: replay, replay: true };
     if (!covers(scope, voter)) fail(403, 'FORBIDDEN', 'This voter is outside your assigned area.');
-    // Only Active voters are paid (Shifted and Not Active, e.g. deceased, are not).
-    if (voter.status !== 'Active') fail(409, 'CONFLICT', `This voter is ${voter.status} and cannot receive a payment.`);
+    // Not Active voters (e.g. deceased) are never paid. Shifted voters are, but a BLO needs its Corporator's permission.
+    if (voter.status === 'Not Active') fail(409, 'CONFLICT', 'This voter is Not Active and cannot receive a payment.');
+    if (voter.status === 'Shifted' && admin.role === 'BLO' && !(await isShiftedApproved(db, voter.recordId))) {
+      fail(403, 'FORBIDDEN', 'This voter has shifted. Ask your Corporator for permission before paying.');
+    }
 
     const errors: Record<string, string> = {};
     const amount = Number(body.amount);

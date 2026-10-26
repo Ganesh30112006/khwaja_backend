@@ -318,12 +318,31 @@ reportsRouter.get('/notifications', authenticate, async (req, res) => {
     p.values,
   )).rows.map(txnFor(scope));
   const settings = (await pool.query<AuditLog>(`SELECT ${AUDIT_COLUMNS} FROM audit_logs WHERE entity = 'Settings' ORDER BY "timestamp" DESC, seq DESC LIMIT 10`)).rows;
+  // Corporators hear about permission requests in their wards; BLOs about the answers to theirs.
+  const ap = new Params();
+  const approvalWhere =
+    admin.role === 'CORPORATOR'
+      ? `a.status = 'Pending' AND v.ward_id = ANY(${ap.add(admin.wardIds)})`
+      : `a.status <> 'Pending' AND a.requested_by = ${ap.add(admin.id)} AND a.decided_at IS NOT NULL`;
+  const approvals = (await pool.query<{ recordId: string; voterId: string; fullName: string; status: string; requestedBy: string; at: Date }>(
+    `SELECT v.record_id AS "recordId", v.voter_id AS "voterId", v.full_name AS "fullName", a.status, COALESCE(a.requested_by, '') AS "requestedBy",
+       COALESCE(a.decided_at, a.requested_at) AS at
+     FROM shifted_approvals a JOIN voters v ON v.record_id = a.voter_record_id
+     WHERE ${approvalWhere} AND v.status = 'Shifted' ORDER BY at DESC LIMIT 10`,
+    ap.values,
+  )).rows;
   const items = [
     ...txs.map((t) => ({
       id: t.id,
       title: t.status !== 'Success' ? `Payment ${t.status.toLowerCase()}` : t.adminId ? `Payment recorded by ${t.adminId}` : 'Payment recorded',
       body: `${t.voterName} (${t.voterId}) · ${formatInr(t.amount)}`,
       timestamp: t.timestamp,
+    })),
+    ...approvals.map((a) => ({
+      id: `approval-${a.recordId}-${a.status}`,
+      title: a.status === 'Pending' ? `Permission asked by ${a.requestedBy}` : a.status === 'Approved' ? 'Permission given' : 'Permission refused',
+      body: `${a.fullName} (${a.voterId}) · Shifted voter`,
+      timestamp: a.at,
     })),
     // Field accounts only learn that the payment details changed, not who changed them.
     ...settings.map((a) => ({ id: a.id, title: 'Payment details', body: 'Successfully updated', timestamp: a.timestamp })),
