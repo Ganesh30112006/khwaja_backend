@@ -43,7 +43,7 @@ authRouter.post('/auth/login', loginLimiter, async (req, res) => {
   const candidates = identifier
     ? (await pool.query<Admin & { passwordHash: string }>(
         `SELECT x.*, p.password_hash AS "passwordHash"
-         FROM (${ADMIN_SELECT} WHERE ${byMobile ? 'a.mobile = $1' : `${NAME_KEY_SQL('a.full_name')} = $1`}) x
+         FROM (${ADMIN_SELECT} WHERE a.deleted_at IS NULL AND ${byMobile ? 'a.mobile = $1' : `${NAME_KEY_SQL('a.full_name')} = $1`}) x
          JOIN admins p ON p.id = x.id`,
         [byMobile ? normalizeMobile(identifier) : nameKey(identifier)],
       )).rows

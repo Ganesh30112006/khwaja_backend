@@ -41,7 +41,7 @@ export async function verifyDummy(password: string): Promise<false> {
  */
 export async function passwordTakenForName(db: Db, fullName: string, password: string, excludeId = ''): Promise<boolean> {
   const { rows } = await db.query<{ hash: string }>(
-    `SELECT password_hash AS hash FROM admins WHERE ${NAME_KEY_SQL('full_name')} = $1 AND id <> $2`,
+    `SELECT password_hash AS hash FROM admins WHERE ${NAME_KEY_SQL('full_name')} = $1 AND id <> $2 AND deleted_at IS NULL`,
     [nameKey(fullName), excludeId],
   );
   for (const r of rows) if (await verifyPassword(password, r.hash)) return true;

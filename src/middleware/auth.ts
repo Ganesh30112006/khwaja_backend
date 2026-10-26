@@ -44,7 +44,7 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
     if (session) await pool.query('DELETE FROM sessions WHERE id = $1', [session.id]);
     fail(401, 'SESSION_EXPIRED', 'Your session has expired. Please log in again.');
   }
-  const admin = (await pool.query<Admin>(`${ADMIN_SELECT} WHERE a.id = $1`, [session.adminId])).rows[0];
+  const admin = (await pool.query<Admin>(`${ADMIN_SELECT} WHERE a.id = $1 AND a.deleted_at IS NULL`, [session.adminId])).rows[0];
   if (!admin || admin.status !== 'Active') {
     await pool.query('DELETE FROM sessions WHERE id = $1', [session.id]);
     fail(401, 'SESSION_EXPIRED', 'Your account is no longer active. Contact the Super Admin.');

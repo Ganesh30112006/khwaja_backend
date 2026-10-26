@@ -172,7 +172,7 @@ async function bloTotals(admin: Admin, scope: Scope, f: Filters): Promise<BloRow
   const p = new Params();
   const tx = `SELECT t.admin_id, t.voter_record_id, t.amount FROM payment_transactions t JOIN voters v ON v.record_id = t.voter_record_id
               WHERE ${voterWhere(scope, f, p)} AND ${txWhere(admin, f, p)}`;
-  const where = [`a.role = 'BLO'`];
+  const where = [`a.role = 'BLO'`, 'a.deleted_at IS NULL'];
   if (admin.role === 'CORPORATOR') where.push(`a.corporator_id = ${p.add(admin.id)}`);
   if (f.adminId && admin.role === 'SUPER_ADMIN') where.push(`a.id = ${p.add(f.adminId)}`);
   if (f.wardId) where.push(`(EXISTS (SELECT 1 FROM admin_wards aw WHERE aw.admin_id = a.id AND aw.ward_id = ${p.add(f.wardId)}) OR EXISTS (SELECT 1 FROM tx WHERE tx.admin_id = a.id))`);
@@ -227,9 +227,9 @@ reportsRouter.get('/reports/dashboard', authenticate, async (req, res) => {
   )).rows;
 
   const counts = (await pool.query<{ corporators: number; blos: number; myBlos: number; booths: number }>(
-    `SELECT (SELECT count(*) FROM admins WHERE role = 'CORPORATOR')::int AS corporators,
-            (SELECT count(*) FROM admins WHERE role = 'BLO')::int AS blos,
-            (SELECT count(*) FROM admins WHERE role = 'BLO' AND corporator_id = $1)::int AS "myBlos",
+    `SELECT (SELECT count(*) FROM admins WHERE role = 'CORPORATOR' AND deleted_at IS NULL)::int AS corporators,
+            (SELECT count(*) FROM admins WHERE role = 'BLO' AND deleted_at IS NULL)::int AS blos,
+            (SELECT count(*) FROM admins WHERE role = 'BLO' AND corporator_id = $1 AND deleted_at IS NULL)::int AS "myBlos",
             (SELECT count(*) FROM booths WHERE ($2::text IS NULL OR ward_id = $2) AND ($3::text IS NULL OR id = $3))::int AS booths`,
     [admin.id, f.wardId ?? null, f.boothId ?? null],
   )).rows[0];

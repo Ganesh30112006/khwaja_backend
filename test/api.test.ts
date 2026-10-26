@@ -690,6 +690,38 @@ describe('imports: existing voters', () => {
   });
 });
 
+describe('deleting accounts', () => {
+  it('lets only the Super Admin delete Corporators (with their BLOs) and BLOs; history is kept', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const c1 = await login(C1_MOBILE);
+    const blo = await login(BLO_MOBILE);
+    // A payment recorded by the BLO stays after the BLO is gone.
+    const tx = await expectStatus(call('post', '/payments', blo, pay((await notReceivedVoter(blo)).recordId, 'del-acc')), 201);
+
+    await expectStatus(call('delete', '/admins/C-1-BLO1', c1), 403);
+    await expectStatus(call('delete', '/admins/C-1-BLO1', blo), 403);
+    await expectStatus(call('delete', '/admins/SA-1', sa), 404);
+    expect(await expectStatus(call('delete', '/admins/C-1', sa), 200)).toEqual({ deleted: ['C-1', 'C-1-BLO1', 'C-1-BLO2'] });
+
+    // Signed out, cannot sign in, hidden from lists, ward free, mobile reusable.
+    await expectStatus(call('get', '/auth/me', blo), 401);
+    await expectStatus(call('post', '/auth/login', null, { identifier: C1_MOBILE, password: PASSWORD }), 401);
+    await expectStatus(call('post', '/auth/login', null, { identifier: BLO_MOBILE, password: PASSWORD }), 401);
+    const list = await expectStatus(call('get', '/admins', sa, undefined, { pageSize: 100 }), 200);
+    expect(list.items.map((a: { id: string }) => a.id)).not.toContain('C-1');
+    await expectStatus(call('get', '/admins/C-1-BLO1', sa), 404);
+    const summary = await expectStatus(call('get', '/wards/summary', sa), 200);
+    expect(summary.find((w: { id: string }) => w.id === 'W1').adminIds).toEqual([]);
+    const again = await expectStatus(call('post', '/admins', sa, { role: 'CORPORATOR', fullName: 'New Corporator', mobile: C1_MOBILE, password: 'newpass123', wardIds: ['W1'], boothIds: [], location: '' }), 201);
+    expect(again.id).not.toBe('C-1');
+    // The payment still shows who gave it.
+    expect((await expectStatus(call('get', `/payments/${tx.id}`, sa), 200)).transaction).toMatchObject({ adminId: 'C-1-BLO1', status: 'Success' });
+    const audit = await expectStatus(call('get', '/audit-logs', sa, undefined, { recordRef: 'C-1-BLO2' }), 200);
+    expect(audit.items[0]).toMatchObject({ action: 'Account deleted' });
+    expect(audit.items[0].summary).toContain('with its Corporator C-1');
+  });
+});
+
 describe('wards, reports and audit', () => {
   it('creates and edits wards and booths with unique numbers', async () => {
     const sa = await login(SUPER_MOBILE);

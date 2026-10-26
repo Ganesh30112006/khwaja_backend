@@ -35,7 +35,7 @@ export const ID_SORT_KEYS = [`split_part(a.id, '-', 2)::int`, `COALESCE(NULLIF(r
 export const ADMIN_ORDER = [`a.role = 'SUPER_ADMIN' DESC`, ...ID_SORT_KEYS].join(', ');
 
 export async function findAdmin(db: Db, id: string): Promise<Admin | undefined> {
-  const { rows } = await db.query<Admin>(`${ADMIN_SELECT} WHERE a.id = $1`, [id]);
+  const { rows } = await db.query<Admin>(`${ADMIN_SELECT} WHERE a.id = $1 AND a.deleted_at IS NULL`, [id]);
   return rows[0];
 }
 

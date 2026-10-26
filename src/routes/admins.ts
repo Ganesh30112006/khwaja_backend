@@ -9,7 +9,7 @@ import { nextNumber } from '../lib/ids.js';
 import { pageWindow } from '../lib/pagination.js';
 import { hashPassword, passwordTakenError, passwordTakenForName } from '../lib/password.js';
 import { isValidIndianMobile, isValidPassword, likePattern, normalizeMobile, PASSWORD_RULES, str, strArray } from '../lib/validation.js';
-import { auth, authenticate, requireManager } from '../middleware/auth.js';
+import { auth, authenticate, requireManager, requireSuper } from '../middleware/auth.js';
 
 export const adminsRouter = Router();
 adminsRouter.use('/admins', authenticate, requireManager);
@@ -142,8 +142,8 @@ async function loadManaged(db: Db, actor: Admin, id: string, lock = false): Prom
 
 /** SQL filter for the accounts an actor manages. */
 function managedFilter(actor: Admin, p: Params): string {
-  if (actor.role === 'SUPER_ADMIN') return `a.id <> ${p.add(actor.id)}`;
-  return `a.role = 'BLO' AND a.corporator_id = ${p.add(actor.id)}`;
+  if (actor.role === 'SUPER_ADMIN') return `a.id <> ${p.add(actor.id)} AND a.deleted_at IS NULL`;
+  return `a.role = 'BLO' AND a.corporator_id = ${p.add(actor.id)} AND a.deleted_at IS NULL`;
 }
 
 const ADMIN_SORTS: Record<string, string> = {
@@ -182,7 +182,7 @@ adminsRouter.get('/admins', async (req, res) => {
 adminsRouter.get('/admins/options', async (req, res) => {
   const actor = auth(req).admin;
   const p = new Params();
-  const where = actor.role === 'SUPER_ADMIN' ? 'TRUE' : `(a.id = ${p.add(actor.id)} OR a.corporator_id = ${p.add(actor.id)})`;
+  const where = `a.deleted_at IS NULL AND ${actor.role === 'SUPER_ADMIN' ? 'TRUE' : `(a.id = ${p.add(actor.id)} OR a.corporator_id = ${p.add(actor.id)})`}`;
   const { rows } = await pool.query<Admin>(`${ADMIN_SELECT} WHERE ${where} ORDER BY ${ADMIN_ORDER}`, p.values);
   res.json(rows.map((a) => ({ id: a.id, fullName: a.fullName, role: a.role, corporatorId: a.corporatorId, wardIds: a.wardIds })));
 });
@@ -284,6 +284,34 @@ adminsRouter.patch('/admins/:id/status', async (req, res) => {
     return findAdmin(db, target.id);
   });
   res.json(updated);
+});
+
+/**
+ * Super Admin only: deletes a Corporator (together with its BLOs) or a BLO. The account disappears, cannot
+ * sign in and its mobile number is freed; its past payments, cash records and audit entries are kept.
+ */
+adminsRouter.delete('/admins/:id', requireSuper, async (req, res) => {
+  const actor = auth(req).admin;
+  const deleted = await withTransaction(async (db) => {
+    const target = await loadManaged(db, actor, str(req.params.id), true);
+    if (target.role === 'SUPER_ADMIN') fail(403, 'FORBIDDEN', 'Super Admin accounts cannot be deleted.');
+    const accounts = [target];
+    if (target.role === 'CORPORATOR') {
+      const blos = (await db.query<{ id: string }>(`SELECT id FROM admins WHERE corporator_id = $1 AND deleted_at IS NULL ORDER BY id FOR UPDATE`, [target.id])).rows;
+      for (const b of blos) accounts.push((await findAdmin(db, b.id))!);
+    }
+    const ids = accounts.map((a) => a.id);
+    await db.query('DELETE FROM sessions WHERE admin_id = ANY($1)', [ids]);
+    await db.query('DELETE FROM admin_booths WHERE admin_id = ANY($1)', [ids]);
+    await db.query('DELETE FROM admin_wards WHERE admin_id = ANY($1)', [ids]);
+    await db.query(`UPDATE admins SET deleted_at = now(), status = 'Inactive', mobile = 'deleted:' || id WHERE id = ANY($1)`, [ids]);
+    for (const a of accounts) {
+      const why = a.id === target.id ? '' : ` (with its Corporator ${target.id})`;
+      await addAudit(db, actor, 'Account deleted', 'Admin', a.id, `${a.fullName}, mobile ${a.mobile}${why}`);
+    }
+    return ids;
+  });
+  res.json({ deleted });
 });
 
 /** Sets a new password for a managed account; that account is signed out everywhere. */

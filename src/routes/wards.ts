@@ -203,7 +203,7 @@ wardsRouter.put('/wards/:id/admins', authenticate, requireSuper, async (req, res
     if (!ward) fail(404, 'NOT_FOUND', 'Ward not found.');
     const admins = (await db.query<{ id: string; has: boolean }>(
       `SELECT a.id, EXISTS (SELECT 1 FROM admin_wards aw WHERE aw.admin_id = a.id AND aw.ward_id = $1) AS has
-       FROM admins a WHERE a.role = 'CORPORATOR' ORDER BY split_part(a.id, '-', 2)::int FOR UPDATE OF a`,
+       FROM admins a WHERE a.role = 'CORPORATOR' AND a.deleted_at IS NULL ORDER BY split_part(a.id, '-', 2)::int FOR UPDATE OF a`,
       [ward.id],
     )).rows;
     const changed: string[] = [];
@@ -236,7 +236,7 @@ wardsRouter.put('/booths/:id/admins', authenticate, requireWardManager, async (r
     const admins = (await db.query<{ id: string; has: boolean; allowed: boolean }>(
       `SELECT a.id, EXISTS (SELECT 1 FROM admin_booths ab WHERE ab.admin_id = a.id AND ab.booth_id = $1) AS has,
          EXISTS (SELECT 1 FROM admin_wards cw WHERE cw.admin_id = a.corporator_id AND cw.ward_id = $2) AS allowed
-       FROM admins a WHERE a.role = 'BLO' AND ($3::text IS NULL OR a.corporator_id = $3) ORDER BY a.id FOR UPDATE OF a`,
+       FROM admins a WHERE a.role = 'BLO' AND a.deleted_at IS NULL AND ($3::text IS NULL OR a.corporator_id = $3) ORDER BY a.id FOR UPDATE OF a`,
       [booth.id, booth.wardId, actor.role === 'CORPORATOR' ? actor.id : null],
     )).rows;
     const outside = admins.filter((a) => wanted.includes(a.id) && !a.has && !a.allowed).map((a) => a.id);
