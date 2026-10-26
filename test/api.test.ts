@@ -275,6 +275,27 @@ describe('payments', () => {
     await expectStatus(call('post', `/voters/${active.recordId}/shifted-approval/request`, blo), 409);
   });
 
+  it('removes voters: the Super Admin any, a Corporator only in its own wards', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const c1 = await login(C1_MOBILE);
+    const c2 = await login(C2_MOBILE);
+    const [own, other] = await voters(c1, { paymentStatus: 'Not Received', status: 'Active', pageSize: 2 });
+    const w3 = await notReceivedVoter(c2);
+    // Not its ward, BLOs never, and the voter stays.
+    await expectStatus(call('delete', `/voters/${w3.recordId}`, c1), 404);
+    await expectStatus(call('delete', `/voters/${own.recordId}`, await login(BLO_MOBILE)), 403);
+    await expectStatus(call('delete', `/voters/${own.recordId}`, c1), 204);
+    await expectStatus(call('get', `/voters/${own.recordId}`, sa), 404);
+    await expectStatus(call('delete', `/voters/${w3.recordId}`, sa), 204);
+    // A paid voter is kept until the payment is cancelled; then it can go (with the cancelled payment).
+    const tx = await expectStatus(call('post', '/payments', c1, pay(other.recordId, 'del1')), 201);
+    expect((await expectStatus(call('delete', `/voters/${other.recordId}`, c1), 409)).message).toContain('Cancel the payment');
+    await expectStatus(call('post', `/payments/${tx.id}/cancel`, sa, { kind: 'Cancelled', reason: 'Wrong voter' }), 200);
+    await expectStatus(call('delete', `/voters/${other.recordId}`, c1), 204);
+    const audit = await expectStatus(call('get', '/audit-logs', sa, undefined, { recordRef: own.voterId }), 200);
+    expect(audit.items[0]).toMatchObject({ action: 'Voter removed', adminId: 'C-1' });
+  });
+
   it('only Active voters can be paid; a deaths / shifted list updates statuses in bulk', async () => {
     const sa = await login(SUPER_MOBILE);
     const [a, b] = await voters(sa, { paymentStatus: 'Not Received', status: 'Active', wardId: 'W1', pageSize: 2 });

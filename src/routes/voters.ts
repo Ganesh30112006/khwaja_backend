@@ -182,6 +182,25 @@ const FIELD_LABELS: Record<keyof VoterInput, string> = {
   gender: 'gender',
 };
 
+/**
+ * Removes a voter: the Super Admin any voter, a Corporator only voters in its own wards. A voter who has
+ * received a payment is kept (cancel the payment first); cancelled payments go with the voter.
+ */
+votersRouter.delete('/voters/:recordId', authenticate, requireWardManager, async (req, res) => {
+  const actor = auth(req).admin;
+  await withTransaction(async (db) => {
+    const voter = await loadVoter(db, str(req.params.recordId), true);
+    if (!ownsWard(actor, voter.wardId)) fail(404, 'NOT_FOUND', 'Voter not found.');
+    const paid = await db.query(`SELECT 1 FROM payment_transactions WHERE voter_record_id = $1 AND status = 'Success'`, [voter.recordId]);
+    if (paid.rowCount) fail(409, 'CONFLICT', 'This voter has received a payment and cannot be removed. Cancel the payment first.');
+    await db.query('DELETE FROM idempotency_keys WHERE txn_id IN (SELECT id FROM payment_transactions WHERE voter_record_id = $1)', [voter.recordId]);
+    await db.query('DELETE FROM payment_transactions WHERE voter_record_id = $1', [voter.recordId]);
+    await db.query('DELETE FROM voters WHERE record_id = $1', [voter.recordId]);
+    await addAudit(db, actor, 'Voter removed', 'Voter', voter.voterId, `${voter.fullName}, ${await locationLabel(db, voter)}`);
+  });
+  res.status(204).end();
+});
+
 votersRouter.put('/voters/:recordId', authenticate, requireWardManager, async (req, res) => {
   const actor = auth(req).admin;
   const voter = await withTransaction(async (db) => {
