@@ -73,7 +73,7 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   if (fullName.length < 2) errors.fullName = 'Full name is required';
   else if (fullName.length > 100) errors.fullName = 'Full name is too long';
   if (!houseNumber) errors.houseNumber = 'House number is required';
-  else if (houseNumber.length > 30) errors.houseNumber = 'House number is too long';
+  else if (houseNumber.length > 100) errors.houseNumber = 'House number is too long (at most 100 characters)';
   if (address.length > 250) errors.address = 'Address is too long';
   if (!refs.has(wardId)) errors.wardId = 'Select a valid ward';
   else if (boothId && !refs.get(wardId)!.has(boothId)) errors.boothId = 'Select a booth in this ward';
