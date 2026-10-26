@@ -40,8 +40,9 @@ export function isValidDate(s: unknown): s is string {
 }
 
 /** Request values arrive untyped: treat anything that is not a string as empty. */
+/** A string from a request ('' otherwise). NUL and other control characters (PostgreSQL refuses NUL) are removed. */
 export function str(v: unknown): string {
-  return typeof v === 'string' ? v : '';
+  return typeof v === 'string' ? v.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '') : '';
 }
 
 export function strArray(v: unknown): string[] {
