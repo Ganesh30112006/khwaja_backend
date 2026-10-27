@@ -143,7 +143,7 @@ describe('payments', () => {
   });
 
   it('one person may receive for every member of a household', async () => {
-    const sa = await login(SUPER_MOBILE);
+    const sa = await login(C1_MOBILE);
     const list = await voters(sa, { paymentStatus: 'Not Received', status: 'Active' });
     const byHousehold = new Map<string, VoterRow[]>();
     for (const v of list) byHousehold.set(v.householdId, [...(byHousehold.get(v.householdId) ?? []), v]);
@@ -185,22 +185,27 @@ describe('payments', () => {
 
   it('cancelled payments do not count, and the voter can receive again', async () => {
     const sa = await login(SUPER_MOBILE);
-    const voter = await notReceivedVoter(sa);
-    const tx = await expectStatus(call('post', '/payments', sa, pay(voter.recordId, 'c1')), 201);
+    const c1 = await login(C1_MOBILE);
+    const voter = await notReceivedVoter(c1);
+    const tx = await expectStatus(call('post', '/payments', c1, pay(voter.recordId, 'c1')), 201);
     await expectStatus(call('post', `/payments/${tx.id}/cancel`, sa, { kind: 'Cancelled', reason: 'x' }), 400);
     const cancelled = await expectStatus(call('post', `/payments/${tx.id}/cancel`, sa, { kind: 'Cancelled', reason: 'Wrong voter' }), 200);
     expect(cancelled).toMatchObject({ status: 'Cancelled', statusReason: 'Wrong voter' });
     await expectStatus(call('post', `/payments/${tx.id}/cancel`, sa, { kind: 'Reversed', reason: 'Again' }), 409);
     expect((await expectStatus(call('get', `/voters/${voter.recordId}`, sa), 200)).voter.paymentStatus).toBe('Not Received');
-    await expectStatus(call('post', '/payments', sa, pay(voter.recordId, 'c2')), 201);
+    await expectStatus(call('post', '/payments', c1, pay(voter.recordId, 'c2')), 201);
     const detail = await expectStatus(call('get', `/payments/${tx.id}`, sa), 200);
     expect(detail.audit.map((a: { action: string }) => a.action)).toEqual(['Payment cancelled', 'Payment recorded']);
   });
 
   it('Corporators and BLOs are never shown a Super Admin account', async () => {
     const sa = await login(SUPER_MOBILE);
-    const target = await notReceivedVoter(sa, { boothId: 'B1-1' });
-    const tx = await expectStatus(call('post', '/payments', sa, pay(target.recordId, 'sa-pay')), 201);
+    const c1 = await login(C1_MOBILE);
+    const target = await notReceivedVoter(c1, { boothId: 'B1-1' });
+    // Super Admins no longer record payments, but older ones (moved to the ward's Corporator) still exist.
+    const tx = await expectStatus(call('post', '/payments', c1, pay(target.recordId, 'sa-pay')), 201);
+    await pool.query(`UPDATE payment_transactions SET admin_id = 'SA-1', admin_name = 'Super Admin' WHERE id = $1`, [tx.id]);
+    await expectStatus(call('post', '/payments', sa, pay((await notReceivedVoter(c1)).recordId, 'sa-new')), 403);
     for (const token of [await login(C1_MOBILE), await login(BLO_MOBILE)]) {
       const list = await expectStatus(call('get', '/payments', token, undefined, { pageSize: 100 }), 200);
       expect(list.items.find((t: { id: string }) => t.id === tx.id)).toMatchObject({ adminId: '', adminName: '', givenByName: '' });
@@ -213,11 +218,11 @@ describe('payments', () => {
   });
 
   it('a Corporator filters payment history by who gave the money: itself or its own BLOs only', async () => {
-    const sa = await login(SUPER_MOBILE);
     const blo = await login(BLO_MOBILE);
     const c1 = await login(C1_MOBILE);
     const byBlo = await expectStatus(call('post', '/payments', blo, pay((await notReceivedVoter(blo)).recordId, 'g-blo')), 201);
-    const bySa = await expectStatus(call('post', '/payments', sa, pay((await notReceivedVoter(sa, { boothId: 'B1-1' })).recordId, 'g-sa')), 201);
+    const bySa = await expectStatus(call('post', '/payments', c1, pay((await notReceivedVoter(c1, { boothId: 'B1-1' })).recordId, 'g-sa')), 201);
+    await pool.query(`UPDATE payment_transactions SET admin_id = 'SA-1', admin_name = 'Super Admin' WHERE id = $1`, [bySa.id]);
     const given = async (adminId: string) =>
       (await expectStatus(call('get', '/payments', c1, undefined, { adminId, pageSize: 100 }), 200)).items.map((t: { id: string }) => t.id);
     const blos = await given('C-1-BLO1');
@@ -267,15 +272,15 @@ describe('payments', () => {
     await expectStatus(call('post', `/voters/${b.recordId}/shifted-approval`, c1, { decision: 'Rejected' }), 200);
     await expectStatus(call('post', '/payments', blo, pay(b.recordId, 'sh3')), 403);
     expect(await expectStatus(call('post', `/voters/${b.recordId}/shifted-approval/request`, blo), 200)).toMatchObject({ status: 'Pending' });
-    // Corporators and Super Admins pay Shifted voters without asking.
+    // Corporators pay Shifted voters without asking; Super Admins do not record payments.
     await expectStatus(call('post', '/payments', c1, pay(b.recordId, 'sh4')), 201);
-    await expectStatus(call('post', '/payments', sa, pay(c.recordId, 'sh5')), 201);
+    await expectStatus(call('post', '/payments', sa, pay(c.recordId, 'sh5')), 403);
     // Asking only makes sense for Shifted voters.
     const active = await notReceivedVoter(blo);
     await expectStatus(call('post', `/voters/${active.recordId}/shifted-approval/request`, blo), 409);
   });
 
-  it('removes voters: the Super Admin any, a Corporator only in its own wards', async () => {
+  it('removes voters: the Super Admin for everyone, a Corporator from its own list in its own wards', async () => {
     const sa = await login(SUPER_MOBILE);
     const c1 = await login(C1_MOBILE);
     const c2 = await login(C2_MOBILE);
@@ -285,8 +290,12 @@ describe('payments', () => {
     await expectStatus(call('delete', `/voters/${w3.recordId}`, c1), 404);
     await expectStatus(call('delete', `/voters/${own.recordId}`, await login(BLO_MOBILE)), 403);
     await expectStatus(call('delete', `/voters/${own.recordId}`, c1), 204);
-    await expectStatus(call('get', `/voters/${own.recordId}`, sa), 404);
+    // Gone from C-1's list only; the shared voter stays (the Super Admin still sees it).
+    await expectStatus(call('get', `/voters/${own.recordId}`, c1), 404);
+    expect((await voters(c1, { search: own.voterId })).length).toBe(0);
+    await expectStatus(call('get', `/voters/${own.recordId}`, sa), 200);
     await expectStatus(call('delete', `/voters/${w3.recordId}`, sa), 204);
+    await expectStatus(call('get', `/voters/${w3.recordId}`, c2), 404);
     // A paid voter is kept until the payment is cancelled; then it can go (with the cancelled payment).
     const tx = await expectStatus(call('post', '/payments', c1, pay(other.recordId, 'del1')), 201);
     expect((await expectStatus(call('delete', `/voters/${other.recordId}`, c1), 409)).message).toContain('Cancel the payment');
@@ -303,13 +312,14 @@ describe('payments', () => {
     expect(res).toEqual({ updated: 2, unchanged: 0, notFound: ['NOPE123'] });
     const again = await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Shifted' }), 200);
     expect(again).toMatchObject({ updated: 0, unchanged: 1 });
-    const detail = await expectStatus(call('get', `/voters/${a.recordId}`, sa), 200);
+    const c1 = await login(C1_MOBILE);
+    const detail = await expectStatus(call('get', `/voters/${a.recordId}`, c1), 200);
     // Shifted voters can still be paid (a BLO needs permission, see the test above).
     expect(detail.voter).toMatchObject({ status: 'Shifted', canRecordPayment: true });
     // Dead voters are never paid ("Not Active" is still accepted as the old name).
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [b.voterId], status: 'Not Active' }), 200);
-    expect((await expectStatus(call('get', `/voters/${b.recordId}`, sa), 200)).voter).toMatchObject({ status: 'Dead', canRecordPayment: false });
-    expect((await expectStatus(call('post', '/payments', sa, pay(b.recordId, 'deceased-pay')), 409)).message).toContain('Dead');
+    expect((await expectStatus(call('get', `/voters/${b.recordId}`, c1), 200)).voter).toMatchObject({ status: 'Dead', canRecordPayment: false });
+    expect((await expectStatus(call('post', '/payments', c1, pay(b.recordId, 'deceased-pay')), 409)).message).toContain('Dead');
     await expectStatus(call('post', '/voters/status', sa, { voterIds: [a.voterId], status: 'Gone' }), 400);
     // C-2 covers ward 3 only: a voter in ward 1 is not changed and looks like it does not exist. BLOs cannot do this at all.
     const c2 = await expectStatus(call('post', '/voters/status', await login(C2_MOBILE), { voterIds: [a.voterId], status: 'Active' }), 200);
@@ -321,8 +331,8 @@ describe('payments', () => {
 
   it('validates the amount and receiver, and enforces a fixed amount', async () => {
     const sa = await login(SUPER_MOBILE);
-    const voter = await notReceivedVoter(sa);
-    const bad = await expectStatus(call('post', '/payments', sa, { voterRecordId: voter.recordId, amount: 10.5, receiverName: 'R', receiverMobile: '12345', givenByName: ' ' }), 400);
+    const voter = await notReceivedVoter(await login(C1_MOBILE));
+    const bad = await expectStatus(call('post', '/payments', await login(C1_MOBILE), { voterRecordId: voter.recordId, amount: 10.5, receiverName: 'R', receiverMobile: '12345', givenByName: ' ' }), 400);
     expect(Object.keys(bad.fieldErrors).sort()).toEqual(['amount', 'givenByName', 'receiverMobile', 'receiverName']);
     await expectStatus(call('put', '/settings/payment', sa, { defaultAmount: 1500, effectiveDate: '2000-01-01', allowAmountOverride: false }), 200);
     const c1 = await login(C1_MOBILE);
@@ -342,11 +352,12 @@ describe('payments', () => {
 
   it('keeps unique voter counts separate from payment counts', async () => {
     const sa = await login(SUPER_MOBILE);
-    const voter = await notReceivedVoter(sa);
+    const c1 = await login(C1_MOBILE);
+    const voter = await notReceivedVoter(c1);
     const before = await expectStatus(call('get', '/reports/dashboard', sa), 200);
-    const tx = await expectStatus(call('post', '/payments', sa, pay(voter.recordId, 'u1')), 201);
+    const tx = await expectStatus(call('post', '/payments', c1, pay(voter.recordId, 'u1')), 201);
     await expectStatus(call('post', `/payments/${tx.id}/cancel`, sa, { kind: 'Reversed', reason: 'Returned' }), 200);
-    await expectStatus(call('post', '/payments', sa, pay(voter.recordId, 'u2')), 201);
+    await expectStatus(call('post', '/payments', c1, pay(voter.recordId, 'u2')), 201);
     const after = await expectStatus(call('get', '/reports/dashboard', sa), 200);
     expect(after.votersReceived).toBe(before.votersReceived + 1);
     expect(after.totalTransactions).toBe(before.totalTransactions + 1);
@@ -521,17 +532,59 @@ describe('Corporators and BLOs', () => {
     await expectStatus(call('put', '/booths/B1-1/admins', c2, { adminIds: ['C-2-BLO1'] }), 404);
   });
 
-  it('a ward has one Corporator: assigning a taken ward asks to move it', async () => {
+  it('a ward can have several Corporators; each keeps its own changes, payments and permissions', async () => {
     const sa = await login(SUPER_MOBILE);
-    const input = { ...corporator, wardIds: ['W3'] };
-    const taken = await expectStatus(call('post', '/admins', sa, input), 409);
-    expect(taken).toMatchObject({ code: 'WARD_TAKEN', message: 'Ward 3 is already assigned to C-2 (Sunitha Devi).' });
-    const moved = await expectStatus(call('post', '/admins', sa, { ...input, moveWards: true }), 201);
-    expect(moved.wardIds).toEqual(['W3']);
-    expect((await expectStatus(call('get', '/admins/C-2', sa), 200)).wardIds).toEqual([]);
-    // C-2's BLO lost ward 3 with it.
-    expect((await expectStatus(call('get', '/admins/C-2-BLO1', sa), 200)).wardIds).toEqual([]);
-    await expectStatus(call('put', '/wards/W4/admins', sa, { adminIds: ['C-1', 'C-3'] }), 400);
+    // C-1 joins ward 3 next to C-2 (on the ward, or on a new account).
+    await expectStatus(call('put', '/wards/W3/admins', sa, { adminIds: ['C-2', 'C-1'] }), 204);
+    expect((await expectStatus(call('get', '/admins/C-2', sa), 200)).wardIds).toEqual(['W3']);
+    const extra = await expectStatus(call('post', '/admins', sa, { ...corporator, wardIds: ['W3'] }), 201);
+    expect(extra.wardIds).toEqual(['W3']);
+    const c1 = await login(C1_MOBILE);
+    const c2 = await login(C2_MOBILE);
+    // The same shared list for both.
+    const ids = async (t: string) => (await voters(t, { wardId: 'W3' })).map((v) => v.voterId).sort();
+    expect(await ids(c1)).toEqual(await ids(c2));
+
+    // C-1's edit, status list and removal apply to C-1's list only.
+    const [x, y, z] = (await voters(c2, { wardId: 'W3', status: 'Active', paymentStatus: 'Not Received' })).slice(0, 3);
+    const full = (await expectStatus(call('get', `/voters/${x.recordId}`, c1), 200)).voter;
+    await expectStatus(call('put', `/voters/${x.recordId}`, c1, { ...full, fullName: 'Changed By C1' }), 200);
+    expect((await expectStatus(call('get', `/voters/${x.recordId}`, c1), 200)).voter.fullName).toBe('Changed By C1');
+    expect((await expectStatus(call('get', `/voters/${x.recordId}`, c2), 200)).voter.fullName).toBe(x.fullName);
+    // The Voter ID and ward stay shared.
+    await expectStatus(call('put', `/voters/${x.recordId}`, c1, { ...full, voterId: 'NEW1234567' }), 400);
+    expect(await expectStatus(call('post', '/voters/status', c1, { voterIds: [y.voterId], status: 'Dead' }), 200)).toMatchObject({ updated: 1 });
+    expect((await expectStatus(call('get', `/voters/${y.recordId}`, c1), 200)).voter.status).toBe('Dead');
+    expect((await expectStatus(call('get', `/voters/${y.recordId}`, c2), 200)).voter.status).toBe('Active');
+    await expectStatus(call('delete', `/voters/${z.recordId}`, c1), 204);
+    await expectStatus(call('get', `/voters/${z.recordId}`, c1), 404);
+    await expectStatus(call('get', `/voters/${z.recordId}`, c2), 200);
+
+    // A voter added by one Corporator is shared with the other.
+    const added = await expectStatus(call('post', '/voters', c2, { voterId: 'ZZZ7654321', fullName: 'Shared Voter', wardId: 'W3', boothId: '', houseNumber: '1-1', householdId: '', address: '', status: 'Active' }), 201);
+    expect((await expectStatus(call('get', `/voters/${added.recordId}`, c1), 200)).voter.fullName).toBe('Shared Voter');
+
+    // Each team pays separately: both may pay the same voter once.
+    const t2 = await expectStatus(call('post', '/payments', c2, pay(x.recordId, 'team2')), 201);
+    expect((await expectStatus(call('get', `/voters/${x.recordId}`, c1), 200)).voter).toMatchObject({ paymentStatus: 'Not Received', canRecordPayment: true });
+    const t1 = await expectStatus(call('post', '/payments', c1, pay(x.recordId, 'team1')), 201);
+    await expectStatus(call('post', '/payments', c1, pay(x.recordId, 'team1-again')), 409);
+    await expectStatus(call('get', `/payments/${t2.id}`, c1), 404);
+    const c1Payments = (await expectStatus(call('get', '/payments', c1, undefined, { pageSize: 500 }), 200)).items.map((t: { id: string }) => t.id);
+    expect(c1Payments).toContain(t1.id);
+    expect(c1Payments).not.toContain(t2.id);
+
+    // The Super Admin sees every team, or one team when it picks a Corporator.
+    const all = (await expectStatus(call('get', '/payments', sa, undefined, { pageSize: 500 }), 200)).items.map((t: { id: string }) => t.id);
+    expect(all).toEqual(expect.arrayContaining([t1.id, t2.id]));
+    const asC2 = await request(createApp()).get('/api/payments').query({ pageSize: 500 }).set('Authorization', `Bearer ${sa}`).set('X-Team-Id', 'C-2');
+    expect(asC2.body.items.map((t: { id: string }) => t.id)).toContain(t2.id);
+    expect(asC2.body.items.map((t: { id: string }) => t.id)).not.toContain(t1.id);
+    const viewY = await request(createApp()).get(`/api/voters/${y.recordId}`).set('Authorization', `Bearer ${sa}`).set('X-Team-Id', 'C-1');
+    expect(viewY.body.voter.status).toBe('Dead');
+    // A Corporator never sees the ward's other Corporators.
+    const summary = await expectStatus(call('get', '/wards/summary', c1), 200);
+    expect(summary.find((w: { id: string }) => w.id === 'W3').adminIds).toEqual(['C-1']);
   });
 
   it('deactivating an account ends its sessions', async () => {
@@ -684,9 +737,15 @@ describe('imports: existing voters', () => {
     expect(await run(sa, false)).toMatchObject({ imported: 0, replaced: 0, skipped: 1 });
     expect((await expectStatus(call('get', `/voters/${existing.recordId}`, sa), 200)).voter.fullName).toBe(existing.fullName);
     expect(await run(await login(C1_MOBILE), true)).toMatchObject({ replaced: 0, failed: 1 }); // ward 3 is C-2's
-    expect(await run(await login(C2_MOBILE), true)).toMatchObject({ replaced: 1, failed: 0 });
-    const after = (await expectStatus(call('get', `/voters/${existing.recordId}`, sa), 200)).voter;
-    expect(after).toMatchObject({ recordId: existing.recordId, voterId: row.voterId, fullName: 'Replaced Name', houseNumber: '7-7' });
+    const c2 = await login(C2_MOBILE);
+    expect(await run(c2, true)).toMatchObject({ replaced: 1, failed: 0 });
+    // A Corporator's file replaces the details for its own team; the shared record (and other teams) keep theirs.
+    const after = (await expectStatus(call('get', `/voters/${existing.recordId}`, c2), 200)).voter;
+    expect(after).toMatchObject({ recordId: existing.recordId, voterId: existing.voterId, fullName: 'Replaced Name', houseNumber: '7-7' });
+    expect((await expectStatus(call('get', `/voters/${existing.recordId}`, sa), 200)).voter.fullName).toBe(existing.fullName);
+    // The Super Admin's file replaces the shared record.
+    expect(await run(sa, true)).toMatchObject({ replaced: 1 });
+    expect((await expectStatus(call('get', `/voters/${existing.recordId}`, sa), 200)).voter).toMatchObject({ voterId: row.voterId, fullName: 'Replaced Name' });
   });
 });
 
@@ -864,12 +923,12 @@ describe('wards, reports and audit', () => {
     await expect(pool.query(`UPDATE audit_logs SET summary = 'x'`)).rejects.toThrow(/append-only/);
   });
 
-  it('notifies field accounts about payments in their area by others', async () => {
-    const sa = await login(SUPER_MOBILE);
-    const target = await notReceivedVoter(sa, { boothId: 'B1-1' });
-    await expectStatus(call('post', '/payments', sa, pay(target.recordId, 'n1')), 201);
+  it('notifies field accounts about payments in their area by others in their team', async () => {
+    const c1 = await login(C1_MOBILE);
+    const target = await notReceivedVoter(c1, { boothId: 'B1-1' });
+    await expectStatus(call('post', '/payments', c1, pay(target.recordId, 'n1')), 201);
     const notes = await expectStatus(call('get', '/notifications', await login(BLO_MOBILE)), 200);
-    expect(notes[0]).toMatchObject({ title: 'Payment recorded' });
+    expect(notes[0]).toMatchObject({ title: 'Payment recorded by C-1' });
     expect(notes[0].body).toContain(target.voterId);
   });
 

@@ -35,6 +35,18 @@ export interface VoterListItem extends Voter {
   shiftedApproval: 'Pending' | 'Approved' | 'Rejected' | null;
 }
 
+/**
+ * Voters as one team sees them (alias it `v`): the shared ward list with that team's own changes, and a
+ * `hidden` flag for voters the team removed. `team` is a SQL value (a parameter); NULL gives the shared list.
+ */
+export function votersView(team: string): string {
+  const own = (col: string) => `CASE WHEN o.details THEN o.${col} ELSE b.${col} END AS ${col}`;
+  return `(SELECT b.record_id, b.voter_id, b.ward_id, b.created_at, COALESCE(o.updated_at, b.updated_at) AS updated_at,
+      ${['full_name', 'booth_id', 'house_number', 'household_id', 'address', 'age', 'gender'].map(own).join(', ')},
+      COALESCE(o.status, b.status) AS status, COALESCE(o.hidden, false) AS hidden
+    FROM voters b LEFT JOIN voter_overrides o ON o.voter_record_id = b.record_id AND o.team_id = ${team})`;
+}
+
 export const VOTER_COLUMNS = `v.record_id AS "recordId", v.voter_id AS "voterId", v.full_name AS "fullName",
   v.ward_id AS "wardId", COALESCE(v.booth_id, '') AS "boothId", v.house_number AS "houseNumber", v.household_id AS "householdId",
   v.address, v.status, v.age, v.gender, v.created_at AS "createdAt", v.updated_at AS "updatedAt"`;
@@ -102,21 +114,26 @@ export function voterIdConflict(): ApiError {
 }
 
 /**
- * Adds payment status. A voter has at most one successful payment; lists only hold voters in the admin's area.
+ * Adds the team's payment status. A voter has at most one successful payment per team; lists only hold voters in
+ * the admin's area. Without a team (the Super Admin's shared view) a voter paid by any team shows as Received.
  * Active voters can be paid; Shifted voters too, but a BLO needs its Corporator's permission; Dead never.
+ * Super Admins do not record payments.
  */
 export async function toListItems(db: Db, scope: Scope, voters: Voter[], role: Admin['role']): Promise<VoterListItem[]> {
   const ids = voters.map((v) => v.recordId);
   const txs = ids.length
-    ? (await db.query<PaymentTransaction>(`${TXN_SELECT} WHERE t.voter_record_id = ANY($1) AND t.status = 'Success'`, [ids])).rows.map(txnFor(scope))
+    ? (await db.query<PaymentTransaction>(
+        `${TXN_SELECT} WHERE t.voter_record_id = ANY($1) AND t.status = 'Success' AND ($2::text IS NULL OR t.team_id = $2) ORDER BY t."timestamp"`,
+        [ids, scope.teamId],
+      )).rows.map(txnFor(scope))
     : [];
   const byVoter = new Map(txs.map((t) => [t.voterRecordId, t]));
   const shiftedIds = voters.filter((v) => v.status === 'Shifted').map((v) => v.recordId);
   const approvals = new Map(
-    shiftedIds.length
+    shiftedIds.length && scope.teamId
       ? (await db.query<{ id: string; status: VoterListItem['shiftedApproval'] }>(
-          'SELECT voter_record_id AS id, status FROM shifted_approvals WHERE voter_record_id = ANY($1)',
-          [shiftedIds],
+          'SELECT voter_record_id AS id, status FROM shifted_approvals WHERE voter_record_id = ANY($1) AND team_id = $2',
+          [shiftedIds, scope.teamId],
         )).rows.map((r) => [r.id, r.status])
       : [],
   );
@@ -128,22 +145,74 @@ export async function toListItems(db: Db, scope: Scope, voters: Voter[], role: A
       ...v,
       paymentStatus: tx ? 'Received' : 'Not Received',
       latestPayment: tx,
-      canRecordPayment: !tx && payable && covers(scope, v),
+      canRecordPayment: role !== 'SUPER_ADMIN' && !tx && payable && covers(scope, v),
       shiftedApproval,
     };
   });
 }
 
-export async function loadVoter(db: Db, recordId: string, lock = false): Promise<Voter> {
-  const { rows } = await db.query<Voter>(`SELECT ${VOTER_COLUMNS} FROM voters v WHERE v.record_id = $1${lock ? ' FOR UPDATE' : ''}`, [recordId]);
+/**
+ * A voter as the team sees it (null team: the shared record). A voter the team removed is not found.
+ * `lock` locks the shared record (it serialises payments and changes for the voter).
+ */
+export async function loadVoter(db: Db, recordId: string, lock = false, teamId: string | null = null, includeHidden = false): Promise<Voter> {
+  if (lock) await db.query('SELECT 1 FROM voters WHERE record_id = $1 FOR UPDATE', [recordId]);
+  const { rows } = await db.query<Voter>(
+    `SELECT ${VOTER_COLUMNS} FROM ${votersView('$2')} v WHERE v.record_id = $1${includeHidden ? '' : ' AND NOT v.hidden'}`,
+    [recordId, teamId],
+  );
   if (!rows[0]) fail(404, 'NOT_FOUND', 'Voter not found.');
   return rows[0];
 }
 
-/** The voter with this Voter ID (any case), if there is one. */
-export async function findVoterByVoterId(db: Db, voterId: string, lock = false): Promise<Voter | undefined> {
-  const { rows } = await db.query<Voter>(`SELECT ${VOTER_COLUMNS} FROM voters v WHERE upper(v.voter_id) = upper($1)${lock ? ' FOR UPDATE' : ''}`, [voterId.trim()]);
+/** The shared voter with this Voter ID (any case), if there is one; `hidden` tells whether the team removed it. */
+export async function findVoterByVoterId(db: Db, voterId: string, lock = false, teamId: string | null = null): Promise<(Voter & { hidden: boolean }) | undefined> {
+  if (lock) await db.query('SELECT 1 FROM voters WHERE upper(voter_id) = upper($1) FOR UPDATE', [voterId.trim()]);
+  const { rows } = await db.query<Voter & { hidden: boolean }>(
+    `SELECT ${VOTER_COLUMNS}, v.hidden FROM ${votersView('$2')} v WHERE upper(v.voter_id) = upper($1)`,
+    [voterId.trim(), teamId],
+  );
   return rows[0];
+}
+
+/**
+ * Saves a team's own details for a shared voter (its voter form or an import that replaces the voter). The
+ * Voter ID and ward are shared by every team, so only the Super Admin changes them. The voter is shown again
+ * if the team had removed it.
+ */
+export async function saveTeamVoter(db: Db, teamId: string, current: Voter, input: VoterInput): Promise<Voter> {
+  if (input.voterId.toUpperCase() !== current.voterId.toUpperCase() || input.wardId !== current.wardId) {
+    fail(400, 'VALIDATION', 'The Voter ID and ward are shared with other Corporators and cannot be changed here.', {
+      ...(input.voterId.toUpperCase() !== current.voterId.toUpperCase() ? { voterId: 'Only the Super Admin can change the Voter ID' } : {}),
+      ...(input.wardId !== current.wardId ? { wardId: 'Only the Super Admin can move a voter to another ward' } : {}),
+    });
+  }
+  await db.query(
+    `INSERT INTO voter_overrides (team_id, voter_record_id, details, full_name, booth_id, house_number, household_id, address, age, gender, status, hidden, updated_at)
+     VALUES ($1, $2, true, $3, NULLIF($4, ''), $5, $6, $7, $8, $9, $10, false, now())
+     ON CONFLICT (team_id, voter_record_id) DO UPDATE SET details = true, full_name = $3, booth_id = NULLIF($4, ''), house_number = $5,
+       household_id = $6, address = $7, age = $8, gender = $9, status = $10, hidden = false, updated_at = now()`,
+    [teamId, current.recordId, input.fullName, input.boothId, input.houseNumber, input.householdId, input.address, input.age, input.gender, input.status],
+  );
+  return loadVoter(db, current.recordId, false, teamId);
+}
+
+/** Sets a team's own status for shared voters (a deaths / shifted list, or its voter form). */
+export async function setTeamStatus(db: Db, teamId: string, recordIds: string[], status: VoterStatus): Promise<void> {
+  await db.query(
+    `INSERT INTO voter_overrides (team_id, voter_record_id, status, updated_at) SELECT $1, unnest($2::text[]), $3, now()
+     ON CONFLICT (team_id, voter_record_id) DO UPDATE SET status = $3, updated_at = now()`,
+    [teamId, recordIds, status],
+  );
+}
+
+/** Removes a shared voter from one team's list only (other Corporators keep it). */
+export async function hideForTeam(db: Db, teamId: string, recordId: string): Promise<void> {
+  await db.query(
+    `INSERT INTO voter_overrides (team_id, voter_record_id, hidden, updated_at) VALUES ($1, $2, true, now())
+     ON CONFLICT (team_id, voter_record_id) DO UPDATE SET hidden = true, updated_at = now()`,
+    [teamId, recordId],
+  );
 }
 
 /** Saves validated details over an existing voter (the voter form, or an import that replaces a voter). */

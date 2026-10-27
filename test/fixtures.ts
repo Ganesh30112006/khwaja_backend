@@ -153,10 +153,10 @@ export async function seedDemo(db: pg.PoolClient, password: string, now = Date.n
   let auditSeq = 0;
   for (const t of [...txs].sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())) {
     await db.query(
-      `INSERT INTO payment_transactions (id, voter_record_id, voter_id, voter_name, ward_id, booth_id, amount, receiver_name, receiver_mobile, "timestamp", admin_id, admin_name, status, status_reason)
-       VALUES ($1, $2, $3, $4, $5, $6, 2000, $7, $8, $9, $10, $11, $12, $13)`,
+      `INSERT INTO payment_transactions (id, voter_record_id, voter_id, voter_name, ward_id, booth_id, amount, receiver_name, receiver_mobile, "timestamp", admin_id, admin_name, status, status_reason, team_id)
+       VALUES ($1, $2, $3, $4, $5, $6, 2000, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [t.id, t.voter.recordId, t.voter.voterId, t.voter.fullName, t.voter.wardId, t.voter.boothId, t.receiverName, t.receiverMobile, t.timestamp, t.admin.id, t.admin.fullName,
-        t.cancelled ? 'Cancelled' : 'Success', t.cancelled ? 'Entered for wrong voter' : null],
+        t.cancelled ? 'Cancelled' : 'Success', t.cancelled ? 'Entered for wrong voter' : null, t.admin.role === 'CORPORATOR' ? t.admin.id : t.admin.corporatorId],
     );
     auditSeq++;
     await db.query(

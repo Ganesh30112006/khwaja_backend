@@ -100,30 +100,6 @@ async function boothList(db: Db, ids: string[]): Promise<string> {
   return rows.length ? rows.map((r) => r.number).join(', ') : 'all in ward';
 }
 
-/**
- * A ward has one Corporator. When a Corporator is given wards another Corporator already has, the request fails
- * with WARD_TAKEN (so the screen can offer "move" or "cancel"), unless `move` is set: then those wards are taken
- * from the other Corporators and their BLOs.
- */
-async function claimWards(db: Db, actor: Admin, corporatorId: string, wardIds: string[], move: boolean): Promise<void> {
-  const clashes = (await db.query<{ wardId: string; ward: number; ownerId: string; ownerName: string }>(
-    `SELECT aw.ward_id AS "wardId", w.number AS ward, a.id AS "ownerId", a.full_name AS "ownerName"
-     FROM admin_wards aw JOIN admins a ON a.id = aw.admin_id AND a.role = 'CORPORATOR' JOIN wards w ON w.id = aw.ward_id
-     WHERE aw.ward_id = ANY($1) AND a.id <> $2 ORDER BY w.number`,
-    [wardIds, corporatorId],
-  )).rows;
-  if (!clashes.length) return;
-  if (!move) {
-    const message = clashes.map((c) => `Ward ${c.ward} is already assigned to ${c.ownerId} (${c.ownerName})`).join('. ');
-    fail(409, 'WARD_TAKEN', `${message}.`, { wardIds: message });
-  }
-  for (const c of clashes) {
-    await db.query('DELETE FROM admin_wards WHERE admin_id = $1 AND ward_id = $2', [c.ownerId, c.wardId]);
-    await trimBlosToCorporator(db, c.ownerId);
-    await addAudit(db, actor, 'Ward moved', 'Ward', c.wardId, `Ward ${c.ward} moved from ${c.ownerId} to ${corporatorId || 'the new Corporator'}`);
-  }
-}
-
 /** A duplicate mobile that slipped past validation because of a concurrent request. */
 function mobileTaken(err: unknown): never {
   if (isUniqueViolation(err, 'admins_mobile_key')) {
@@ -222,7 +198,6 @@ adminsRouter.post('/admins', passwordWriteLimiter, async (req, res) => {
     }
     const input = await validateAdminInput(db, body, role, corporator);
     if (await passwordTakenForName(db, input.fullName, body.password)) throw passwordTakenError(input.fullName, 'password');
-    if (role === 'CORPORATOR') await claimWards(db, actor, '', input.wardIds, body.moveWards === true);
     const id = corporator
       ? `${corporator.id}-BLO${(await db.query<{ n: number }>('UPDATE admins SET blo_counter = blo_counter + 1 WHERE id = $1 RETURNING blo_counter AS n', [corporator.id])).rows[0].n}`
       : role === 'SUPER_ADMIN'
@@ -249,7 +224,6 @@ adminsRouter.put('/admins/:id', async (req, res) => {
     const target = await loadManaged(db, actor, str(req.params.id), true);
     const corporator = target.role === 'BLO' && target.corporatorId ? (await findAdmin(db, target.corporatorId)) ?? null : null;
     const input = await validateAdminInput(db, req.body ?? {}, target.role as ManagedRole, corporator, target.id);
-    if (target.role === 'CORPORATOR') await claimWards(db, actor, target.id, input.wardIds, req.body?.moveWards === true);
     const changes: string[] = [];
     if (target.fullName !== input.fullName) changes.push(`name "${target.fullName}" → "${input.fullName}"`);
     if (target.mobile !== input.mobile) changes.push('mobile changed');

@@ -25,7 +25,7 @@ export function createApp() {
   // Large lists and exports are JSON; gzip makes them about 10x smaller over mobile networks.
   app.use(compression());
   // Same-origin deployments need no CORS; otherwise list the frontend origins in CORS_ORIGINS.
-  if (config.corsOrigins.length) app.use(cors({ origin: config.corsOrigins, allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'] }));
+  if (config.corsOrigins.length) app.use(cors({ origin: config.corsOrigins, allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Team-Id'] }));
   app.use(express.json({ limit: '1mb' }));
 
   // Load balancer / Elastic Beanstalk health check (also confirms the database is reachable).

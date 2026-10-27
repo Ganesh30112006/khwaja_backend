@@ -8,6 +8,7 @@ import { addDays, sqlLocalDate, today } from '../lib/time.js';
 import { formatInr, isValidDate, likePattern, str } from '../lib/validation.js';
 import { auth, authenticate, requireSuper } from '../middleware/auth.js';
 import { TXN_SELECT, txnFor, type PaymentTransaction } from '../services/payments.js';
+import { votersView } from '../services/voters.js';
 
 export const reportsRouter = Router();
 
@@ -50,17 +51,26 @@ interface AdminRow {
   uniqueVoters: number;
 }
 
-/** Voters in the admin's area matching the ward/booth filters (alias v). */
+/** The voters as the scope's team sees them (alias it v; the Super Admin's shared view: the shared list). */
+function teamVoters(scope: Scope, p: Params): string {
+  return votersView(p.add(scope.teamId));
+}
+
+/** Voters in the admin's area matching the ward/booth filters (alias v); voters the team removed are left out. */
 function voterWhere(scope: Scope, f: Filters, p: Params): string {
-  const where = [coversSql(scope, (v) => p.add(v), 'v.ward_id', 'v.booth_id')];
+  const where = ['NOT v.hidden', coversSql(scope, (v) => p.add(v), 'v.ward_id', 'v.booth_id')];
   if (f.wardId) where.push(`v.ward_id = ${p.add(f.wardId)}`);
   if (f.boothId) where.push(`v.booth_id = ${p.add(f.boothId)}`);
   return where.join(' AND ');
 }
 
-/** Successful payments in the date range (and for one admin, Super Admin filter only) (alias t). */
-function txWhere(admin: Admin, f: Filters, p: Params): string {
+/**
+ * The team's successful payments in the date range (and for one admin, Super Admin filter only) (alias t). The
+ * Super Admin's shared view counts every team's payments.
+ */
+function txWhere(admin: Admin, scope: Scope, f: Filters, p: Params): string {
   const where = [`t.status = 'Success'`];
+  if (scope.teamId) where.push(`t.team_id = ${p.add(scope.teamId)}`);
   if (f.from) where.push(`${sqlLocalDate('t."timestamp"')} >= ${p.add(f.from)}::date`);
   if (f.to) where.push(`${sqlLocalDate('t."timestamp"')} <= ${p.add(f.to)}::date`);
   if (f.adminId && admin.role === 'SUPER_ADMIN') where.push(`t.admin_id = ${p.add(f.adminId)}`);
@@ -74,12 +84,13 @@ function txWhere(admin: Admin, f: Filters, p: Params): string {
  */
 async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
   const p = new Params();
+  const view = teamVoters(scope, p);
   const vw = voterWhere(scope, f, p);
-  const tw = txWhere(admin, f, p);
+  const tw = txWhere(admin, scope, f, p);
   const cells = (await pool.query<{
     wardId: string; boothId: string; voters: number; active: number; dead: number; shifted: number; received: number; transactions: number; amount: number;
   }>(
-    `WITH sv AS (SELECT v.record_id, v.ward_id, v.booth_id, v.status FROM voters v WHERE ${vw}),
+    `WITH sv AS (SELECT v.record_id, v.ward_id, v.booth_id, v.status FROM ${view} v WHERE ${vw}),
           tx AS (SELECT t.voter_record_id, t.amount FROM payment_transactions t JOIN sv ON sv.record_id = t.voter_record_id WHERE ${tw}),
           vt AS (SELECT voter_record_id, count(*) AS n, sum(amount) AS amount FROM tx GROUP BY voter_record_id)
      SELECT sv.ward_id AS "wardId", COALESCE(sv.booth_id, '') AS "boothId", count(*)::int AS voters,
@@ -128,7 +139,7 @@ async function buildAggregates(admin: Admin, scope: Scope, f: Filters) {
   const byBooth = [...byBoothMap.values()].sort((a, b) => (boothNo.get(a.key) ?? 0) - (boothNo.get(b.key) ?? 0));
 
   const q2 = new Params();
-  const scopedTx = `FROM payment_transactions t JOIN voters v ON v.record_id = t.voter_record_id WHERE ${voterWhere(scope, f, q2)} AND ${txWhere(admin, f, q2)}`;
+  const scopedTx = `FROM payment_transactions t JOIN ${teamVoters(scope, q2)} v ON v.record_id = t.voter_record_id WHERE ${voterWhere(scope, f, q2)} AND ${txWhere(admin, scope, f, q2)}`;
   const byAdmin = (await pool.query<AdminRow>(
     `SELECT t.admin_id AS "adminId", (array_agg(t.admin_name ORDER BY t."timestamp" DESC))[1] AS "adminName",
        count(*)::int AS transactions, sum(t.amount)::int AS amount, count(DISTINCT t.voter_record_id)::int AS "uniqueVoters"
@@ -170,11 +181,12 @@ interface BloRow extends AdminRow {
 async function bloTotals(admin: Admin, scope: Scope, f: Filters): Promise<BloRow[]> {
   if (admin.role === 'BLO') return [];
   const p = new Params();
-  const tx = `SELECT t.admin_id, t.voter_record_id, t.amount FROM payment_transactions t JOIN voters v ON v.record_id = t.voter_record_id
-              WHERE ${voterWhere(scope, f, p)} AND ${txWhere(admin, f, p)}`;
+  const tx = `SELECT t.admin_id, t.voter_record_id, t.amount FROM payment_transactions t JOIN ${teamVoters(scope, p)} v ON v.record_id = t.voter_record_id
+              WHERE ${voterWhere(scope, f, p)} AND ${txWhere(admin, scope, f, p)}`;
   const where = [`a.role = 'BLO'`, 'a.deleted_at IS NULL'];
   if (admin.role === 'CORPORATOR') where.push(`a.corporator_id = ${p.add(admin.id)}`);
   if (f.adminId && admin.role === 'SUPER_ADMIN') where.push(`a.id = ${p.add(f.adminId)}`);
+  if (scope.teamId && admin.role === 'SUPER_ADMIN') where.push(`a.corporator_id = ${p.add(scope.teamId)}`);
   if (f.wardId) where.push(`(EXISTS (SELECT 1 FROM admin_wards aw WHERE aw.admin_id = a.id AND aw.ward_id = ${p.add(f.wardId)}) OR EXISTS (SELECT 1 FROM tx WHERE tx.admin_id = a.id))`);
   return (await pool.query<BloRow>(
     `WITH tx AS (${tx})
@@ -216,6 +228,7 @@ reportsRouter.get('/reports/dashboard', authenticate, async (req, res) => {
 
   const pr = new Params();
   const recentWhere = [isSuper ? 'TRUE' : `(t.admin_id = ${pr.add(admin.id)} OR ${coversSql(scope, (v) => pr.add(v), 't.ward_id', 't.booth_id')})`];
+  if (scope.teamId) recentWhere.push(`t.team_id = ${pr.add(scope.teamId)}`);
   if (f.from) recentWhere.push(`${sqlLocalDate('t."timestamp"')} >= ${pr.add(f.from)}::date`);
   if (f.to) recentWhere.push(`${sqlLocalDate('t."timestamp"')} <= ${pr.add(f.to)}::date`);
   if (f.wardId) recentWhere.push(`t.ward_id = ${pr.add(f.wardId)}`);
@@ -267,8 +280,8 @@ reportsRouter.get('/reports', authenticate, async (req, res) => {
   const monthly = (await pool.query<{ month: string; transactions: number; uniqueVoters: number; amount: number }>(
     `SELECT to_char(${sqlLocalDate('t."timestamp"')}, 'YYYY-MM') AS month, count(*)::int AS transactions,
        count(DISTINCT t.voter_record_id)::int AS "uniqueVoters", sum(t.amount)::int AS amount
-     FROM payment_transactions t JOIN voters v ON v.record_id = t.voter_record_id
-     WHERE ${voterWhere(scope, f, p)} AND ${txWhere(admin, f, p)} GROUP BY 1 ORDER BY 1 DESC`,
+     FROM payment_transactions t JOIN ${teamVoters(scope, p)} v ON v.record_id = t.voter_record_id
+     WHERE ${voterWhere(scope, f, p)} AND ${txWhere(admin, scope, f, p)} GROUP BY 1 ORDER BY 1 DESC`,
     p.values,
   )).rows;
   res.json({
@@ -314,21 +327,22 @@ reportsRouter.get('/notifications', authenticate, async (req, res) => {
   }
   const p = new Params();
   const txs = (await pool.query<PaymentTransaction>(
-    `${TXN_SELECT} WHERE t.admin_id <> ${p.add(admin.id)} AND ${coversSql(scope, (v) => p.add(v), 't.ward_id', 't.booth_id')} ORDER BY t."timestamp" DESC LIMIT 10`,
+    `${TXN_SELECT} WHERE t.admin_id <> ${p.add(admin.id)} AND t.team_id = ${p.add(scope.teamId)} AND ${coversSql(scope, (v) => p.add(v), 't.ward_id', 't.booth_id')}
+     ORDER BY t."timestamp" DESC LIMIT 10`,
     p.values,
   )).rows.map(txnFor(scope));
   const settings = (await pool.query<AuditLog>(`SELECT ${AUDIT_COLUMNS} FROM audit_logs WHERE entity = 'Settings' ORDER BY "timestamp" DESC, seq DESC LIMIT 10`)).rows;
-  // Corporators hear about permission requests in their wards; BLOs about the answers to theirs.
+  // Corporators hear about their BLOs' permission requests; BLOs about the answers to theirs.
   const ap = new Params();
   const approvalWhere =
     admin.role === 'CORPORATOR'
-      ? `a.status = 'Pending' AND v.ward_id = ANY(${ap.add(admin.wardIds)})`
+      ? `a.status = 'Pending' AND a.team_id = ${ap.add(admin.id)} AND v.ward_id = ANY(${ap.add(admin.wardIds)})`
       : `a.status <> 'Pending' AND a.requested_by = ${ap.add(admin.id)} AND a.decided_at IS NOT NULL`;
   const approvals = (await pool.query<{ recordId: string; voterId: string; fullName: string; status: string; requestedBy: string; at: Date }>(
     `SELECT v.record_id AS "recordId", v.voter_id AS "voterId", v.full_name AS "fullName", a.status, COALESCE(a.requested_by, '') AS "requestedBy",
        COALESCE(a.decided_at, a.requested_at) AS at
-     FROM shifted_approvals a JOIN voters v ON v.record_id = a.voter_record_id
-     WHERE ${approvalWhere} AND v.status = 'Shifted' ORDER BY at DESC LIMIT 10`,
+     FROM shifted_approvals a JOIN LATERAL ${votersView('a.team_id')} v ON v.record_id = a.voter_record_id
+     WHERE ${approvalWhere} AND v.status = 'Shifted' AND NOT v.hidden ORDER BY at DESC LIMIT 10`,
     ap.values,
   )).rows;
   const items = [

@@ -6,7 +6,7 @@ import { ApiError, fail } from '../lib/errors.js';
 import { str } from '../lib/validation.js';
 import { auth, authenticate, requireWardManager } from '../middleware/auth.js';
 import { ownsWard } from '../lib/admins.js';
-import { findVoterByVoterId, insertVoter, loadLocationRefs, updateVoter, validateVoterInput } from '../services/voters.js';
+import { findVoterByVoterId, insertVoter, loadLocationRefs, saveTeamVoter, updateVoter, validateVoterInput } from '../services/voters.js';
 
 export const importsRouter = Router();
 importsRouter.use('/imports', authenticate, requireWardManager);
@@ -64,12 +64,15 @@ async function findJob(id: string, adminId: string, message: string) {
 }
 
 /**
- * Re-validates and saves each row on its own. A row whose Voter ID already exists is skipped, unless the user chose
- * to replace existing voters (`replace: true`): then that voter's details are overwritten (payments stay with it).
- * Corporators can only import into, and replace voters in, their own wards. Any other problem fails that row.
+ * Re-validates and saves each row on its own. New voters join the shared ward list (every Corporator of the ward
+ * gets them). A row whose Voter ID already exists is skipped, unless the user chose to replace existing voters
+ * (`replace: true`): then a Corporator's file replaces that voter's details for its own team only, and the Super
+ * Admin's file replaces the shared details (payments stay with the voter). Corporators can only import into, and
+ * replace voters in, their own wards. Any other problem fails that row.
  */
 importsRouter.post('/imports/:id/rows', async (req, res) => {
   const { admin } = auth(req);
+  const team = admin.role === 'CORPORATOR' ? admin.id : null;
   await findJob(str(req.params.id), admin.id, 'Import session not found. Start the import again.');
   const wardNumbers = new Map((await pool.query<{ id: string; number: number }>('SELECT id, number FROM wards')).rows.map((w) => [w.id, w.number]));
   const rows: unknown[] = Array.isArray(req.body?.rows) ? req.body.rows : [];
@@ -82,14 +85,15 @@ importsRouter.post('/imports/:id/rows', async (req, res) => {
     const body = (row.voter ?? {}) as Record<string, unknown>;
     try {
       const outcome = await withTransaction(async (db) => {
-        const existing = row.replace === true ? await findVoterByVoterId(db, String(body.voterId ?? ''), true) : undefined;
+        const existing = row.replace === true ? await findVoterByVoterId(db, String(body.voterId ?? ''), true, team) : undefined;
         if (existing && !ownsWard(admin, existing.wardId)) {
           fail(403, 'FORBIDDEN', 'This Voter ID belongs to a voter outside your wards.');
         }
         const input = await validateVoterInput(db, refs, body, existing?.recordId);
         if (!ownsWard(admin, input.wardId)) fail(403, 'FORBIDDEN', `Ward ${wardNumbers.get(input.wardId) ?? '?'} is not assigned to you.`);
         if (existing) {
-          await updateVoter(db, existing.recordId, input);
+          if (team) await saveTeamVoter(db, team, existing, input);
+          else await updateVoter(db, existing.recordId, input);
           return 'replaced' as const;
         }
         await insertVoter(db, input);

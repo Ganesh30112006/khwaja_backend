@@ -17,6 +17,8 @@ export interface PaymentTransaction {
   timestamp: Date;
   adminId: string;
   adminName: string;
+  /** The Corporator whose team made the payment. */
+  teamId: string | null;
   /** Who handed over the cash, as typed on the payment form (prefilled with the account name). */
   givenByName: string;
   status: TransactionStatus;
@@ -26,7 +28,7 @@ export interface PaymentTransaction {
 /** Payment columns (alias t) in the API shape; statusReason is omitted when empty (see cleanTxn). */
 export const TXN_COLUMNS = `t.id, t.voter_record_id AS "voterRecordId", t.voter_id AS "voterId", t.voter_name AS "voterName",
   t.ward_id AS "wardId", COALESCE(t.booth_id, '') AS "boothId", t.amount, t.receiver_name AS "receiverName",
-  t.receiver_mobile AS "receiverMobile", t."timestamp", t.admin_id AS "adminId", t.admin_name AS "adminName",
+  t.receiver_mobile AS "receiverMobile", t."timestamp", t.admin_id AS "adminId", t.admin_name AS "adminName", t.team_id AS "teamId",
   t.given_by_name AS "givenByName", t.status, t.status_reason AS "statusReason"`;
 
 export const TXN_SELECT = `SELECT ${TXN_COLUMNS} FROM payment_transactions t`;

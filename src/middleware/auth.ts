@@ -51,7 +51,8 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
   }
   // Refresh "last seen" at most once a minute to avoid a write on every request.
   if (session.stale) await pool.query('UPDATE sessions SET last_seen_at = now() WHERE id = $1', [session.id]);
-  req.auth = { admin, sessionId: session.id, scope: await loadScope(pool, admin) };
+  // A Super Admin may view one Corporator's team (X-Team-Id); everyone else always sees its own team.
+  req.auth = { admin, sessionId: session.id, scope: await loadScope(pool, admin, (req.get('X-Team-Id') ?? '').trim().slice(0, 30)) };
   next();
 }
 

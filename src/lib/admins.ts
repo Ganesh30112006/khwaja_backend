@@ -59,23 +59,42 @@ export function assertOwnWard(actor: Admin, wardId: string): void {
 }
 
 /**
+ * A ward can have several Corporators. Each Corporator and its BLOs form a team (identified by the
+ * Corporator's ID) with its own view of the shared voter list, its own payments and permissions.
+ */
+export function teamOf(admin: Pick<Admin, 'id' | 'role' | 'corporatorId'>): string | null {
+  if (admin.role === 'CORPORATOR') return admin.id;
+  if (admin.role === 'BLO') return admin.corporatorId;
+  return null;
+}
+
+/**
  * The voters an account covers. A booth assignment narrows its ward to those booths;
  * a ward without booth assignments covers every booth in it. The Super Admin covers everything.
+ * `teamId` is whose view of the voters, payments and permissions is used: the account's own team, or for the
+ * Super Admin the Corporator it chose to view (null = the shared list and every team's payments).
  */
 export interface Scope {
   all: boolean;
   fullWardIds: string[];
   boothIds: string[];
+  teamId: string | null;
 }
 
-export async function loadScope(db: Db, admin: Admin): Promise<Scope> {
-  if (admin.role === 'SUPER_ADMIN') return { all: true, fullWardIds: [], boothIds: [] };
+export async function loadScope(db: Db, admin: Admin, viewTeam = ''): Promise<Scope> {
+  if (admin.role === 'SUPER_ADMIN') {
+    const team = viewTeam
+      ? (await db.query<{ id: string }>(`SELECT id FROM admins WHERE id = $1 AND role = 'CORPORATOR' AND deleted_at IS NULL`, [viewTeam])).rows[0]
+      : undefined;
+    return { all: true, fullWardIds: [], boothIds: [], teamId: team?.id ?? null };
+  }
   const { rows } = await db.query<{ id: string; wardId: string }>('SELECT id, ward_id AS "wardId" FROM booths WHERE id = ANY($1)', [admin.boothIds]);
   const restricted = new Set(rows.map((b) => b.wardId));
   return {
     all: false,
     fullWardIds: admin.wardIds.filter((w) => !restricted.has(w)),
     boothIds: rows.filter((b) => admin.wardIds.includes(b.wardId)).map((b) => b.id),
+    teamId: teamOf(admin),
   };
 }
 

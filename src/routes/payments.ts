@@ -1,6 +1,6 @@
 import { Router, type Request } from 'express';
 import { isUniqueViolation, Params, pool, withTransaction, type Db } from '../db/pool.js';
-import { covers, coversSql, type Admin, type Scope } from '../lib/admins.js';
+import { covers, coversSql, teamOf, type Admin, type Scope } from '../lib/admins.js';
 import { addAudit, AUDIT_COLUMNS, type AuditLog } from '../lib/audit.js';
 import { fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
@@ -17,14 +17,17 @@ export const paymentsRouter = Router();
 paymentsRouter.use('/payments', authenticate);
 
 /**
- * The amount to pay: a ward's own amount (set by its Corporator or a Super Admin) when it has one,
- * otherwise the overall amount from payment settings. Lists the own amounts of wards in the caller's area.
+ * The amount to pay: the team's own amount for the ward (set by its Corporator), else the ward's amount set by a
+ * Super Admin, else the overall amount from payment settings. Lists the ward amounts in the caller's area.
  */
-async function paymentContext(db: Db, admin: Admin, wardId = '') {
+async function paymentContext(db: Db, admin: Admin, wardId = '', teamId: string | null = teamOf(admin)) {
   const settings = await loadSettings(db);
   const defaultAmount = await currentAmount(db, settings);
   const wardAmounts = (await db.query<{ wardId: string; amount: number }>(
-    'SELECT id AS "wardId", payment_amount AS amount FROM wards WHERE payment_amount IS NOT NULL ORDER BY number',
+    `SELECT w.id AS "wardId", COALESCE(ta.amount, w.payment_amount) AS amount
+     FROM wards w LEFT JOIN team_ward_amounts ta ON ta.ward_id = w.id AND ta.team_id = $1
+     WHERE COALESCE(ta.amount, w.payment_amount) IS NOT NULL ORDER BY w.number`,
+    [teamId],
   )).rows.filter((w) => admin.role === 'SUPER_ADMIN' || admin.wardIds.includes(w.wardId));
   const suggestedAmount = wardAmounts.find((w) => w.wardId === wardId)?.amount ?? defaultAmount;
   // A BLO pays out of the cash its Corporator gave it.
@@ -33,7 +36,8 @@ async function paymentContext(db: Db, admin: Admin, wardId = '') {
 }
 
 paymentsRouter.get('/payments/context', async (req, res) => {
-  res.json(await paymentContext(pool, auth(req).admin, str(req.query.wardId)));
+  const { admin, scope } = auth(req);
+  res.json(await paymentContext(pool, admin, str(req.query.wardId), scope.teamId));
 });
 
 async function findReplay(db: Db, adminId: string, key: string): Promise<PaymentTransaction | undefined> {
@@ -43,25 +47,28 @@ async function findReplay(db: Db, adminId: string, key: string): Promise<Payment
 }
 
 /**
- * Records a cash payment. One successful payment per voter (also enforced by a unique index);
- * the receiver may be anyone, including one person receiving for a whole household.
- * A retried request with the same idempotency key returns the original payment.
+ * Records a cash payment for the caller's team (a Corporator and its BLOs). One successful payment per voter for
+ * each team (also enforced by a unique index); other Corporators of the ward pay separately. The receiver may be
+ * anyone, including one person receiving for a whole household. A retried request with the same idempotency key
+ * returns the original payment. Super Admins do not record payments.
  */
 paymentsRouter.post('/payments', async (req, res) => {
   const { admin, scope } = auth(req);
+  const team = teamOf(admin);
+  if (!team) fail(403, 'FORBIDDEN', "Super Admins do not record payments; a Corporator's team does.");
   const body = req.body ?? {};
   const key = (str(req.get('Idempotency-Key')) || str(body.idempotencyKey)).slice(0, 100);
   const result = await withTransaction(async (db) => {
     const early = await findReplay(db, admin.id, key);
     if (early) return { tx: early, replay: true };
     // Locking the voter serialises concurrent payments for the same voter.
-    const voter = await loadVoter(db, str(body.voterRecordId), true);
+    const voter = await loadVoter(db, str(body.voterRecordId), true, team);
     const replay = await findReplay(db, admin.id, key);
     if (replay) return { tx: replay, replay: true };
     if (!covers(scope, voter)) fail(403, 'FORBIDDEN', 'This voter is outside your assigned area.');
     // Dead voters are never paid. Shifted voters are, but a BLO needs its Corporator's permission.
     if (voter.status === 'Dead') fail(409, 'CONFLICT', 'This voter is Dead and cannot receive a payment.');
-    if (voter.status === 'Shifted' && admin.role === 'BLO' && !(await isShiftedApproved(db, voter.recordId))) {
+    if (voter.status === 'Shifted' && admin.role === 'BLO' && !(await isShiftedApproved(db, voter.recordId, team))) {
       fail(403, 'FORBIDDEN', 'This voter has shifted. Ask your Corporator for permission before paying.');
     }
 
@@ -76,26 +83,26 @@ paymentsRouter.post('/payments', async (req, res) => {
     if (!isValidIndianMobile(receiverMobile)) errors.receiverMobile = 'Enter a valid 10-digit Indian mobile number';
     if (givenByName.length < 2) errors.givenByName = 'Enter the name of the person giving the money';
     else if (givenByName.length > 100) errors.givenByName = 'Name is too long';
-    const ctx = await paymentContext(db, admin, voter.wardId);
+    const ctx = await paymentContext(db, admin, voter.wardId, team);
     if (!errors.amount && !ctx.amountEditable && amount !== ctx.suggestedAmount) errors.amount = `Amount must be ${formatInr(ctx.suggestedAmount)}`;
     failIfErrors(errors);
 
     const existing = (await db.query<{ amount: number; receiverName: string }>(
-      `SELECT amount, receiver_name AS "receiverName" FROM payment_transactions WHERE voter_record_id = $1 AND status = 'Success'`,
-      [voter.recordId],
+      `SELECT amount, receiver_name AS "receiverName" FROM payment_transactions WHERE voter_record_id = $1 AND status = 'Success' AND team_id = $2`,
+      [voter.recordId, team],
     )).rows[0];
     if (existing) fail(409, 'CONFLICT', `This voter has already received a payment (${formatInr(existing.amount)} to ${existing.receiverName}).`);
 
     const id = `TXN-${pad(await nextNumber(db, 'txn'), 6)}`;
     const { rows } = await db
       .query<PaymentTransaction>(
-        `INSERT INTO payment_transactions AS t (id, voter_record_id, voter_id, voter_name, ward_id, booth_id, amount, receiver_name, receiver_mobile, "timestamp", admin_id, admin_name, given_by_name, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, 'Success')
+        `INSERT INTO payment_transactions AS t (id, voter_record_id, voter_id, voter_name, ward_id, booth_id, amount, receiver_name, receiver_mobile, "timestamp", admin_id, admin_name, given_by_name, status, team_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10, $11, $12, 'Success', $13)
          RETURNING ${TXN_COLUMNS}`,
-        [id, voter.recordId, voter.voterId, voter.fullName, voter.wardId, voter.boothId || null, amount, receiverName, normalizeMobile(receiverMobile), admin.id, admin.fullName, givenByName],
+        [id, voter.recordId, voter.voterId, voter.fullName, voter.wardId, voter.boothId || null, amount, receiverName, normalizeMobile(receiverMobile), admin.id, admin.fullName, givenByName, team],
       )
       .catch((err) => {
-        if (isUniqueViolation(err, 'payment_one_success_per_voter_idx')) fail(409, 'CONFLICT', 'This voter has already received a payment.');
+        if (isUniqueViolation(err, 'payment_one_success_per_team_idx')) fail(409, 'CONFLICT', 'This voter has already received a payment.');
         throw err;
       });
     if (key) await db.query('INSERT INTO idempotency_keys (admin_id, key, txn_id) VALUES ($1, $2, $3)', [admin.id, key, id]);
@@ -105,10 +112,14 @@ paymentsRouter.post('/payments', async (req, res) => {
   res.status(result.replay ? 200 : 201).json(result.tx);
 });
 
-/** WHERE clause for payment history: the admin's area (where the voter was when paid) plus filters. */
+/**
+ * WHERE clause for payment history: the team's own payments in the admin's area (where the voter was when paid)
+ * plus filters. The Super Admin sees every team's payments, or one team's when viewing a Corporator.
+ */
 function paymentFilter(q: Request['query'], admin: Admin, scope: Scope, p: Params): string {
   const where: string[] = [];
   if (!scope.all) where.push(coversSql(scope, (v) => p.add(v), 't.ward_id', 't.booth_id'));
+  if (scope.teamId) where.push(`t.team_id = ${p.add(scope.teamId)}`);
   if (isValidDate(q.from)) where.push(`${sqlLocalDate('t."timestamp"')} >= ${p.add(q.from)}::date`);
   if (isValidDate(q.to)) where.push(`${sqlLocalDate('t."timestamp"')} <= ${p.add(q.to)}::date`);
   if (str(q.wardId)) where.push(`t.ward_id = ${p.add(str(q.wardId))}`);
@@ -162,7 +173,8 @@ paymentsRouter.get('/payments/export', async (req, res) => {
 async function loadVisiblePayment(db: Db, scope: Scope, id: string, lock = false): Promise<PaymentTransaction> {
   const { rows } = await db.query<PaymentTransaction>(`${TXN_SELECT} WHERE t.id = $1${lock ? ' FOR UPDATE' : ''}`, [id]);
   const tx = rows[0];
-  if (!tx || !covers(scope, tx)) fail(404, 'NOT_FOUND', 'Payment not found.');
+  // Another team's payment is never shown (the Super Admin's shared view shows all).
+  if (!tx || !covers(scope, tx) || (scope.teamId && tx.teamId !== scope.teamId)) fail(404, 'NOT_FOUND', 'Payment not found.');
   return cleanTxn(tx);
 }
 

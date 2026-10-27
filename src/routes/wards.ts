@@ -6,6 +6,7 @@ import { fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
 import { formatInr, isValidAmount, str, strArray } from '../lib/validation.js';
 import { auth, authenticate, requireSuper, requireWardManager } from '../middleware/auth.js';
+import { votersView } from '../services/voters.js';
 import { trimBlosToCorporator } from './admins.js';
 
 export const wardsRouter = Router();
@@ -84,22 +85,31 @@ wardsRouter.get('/wards', authenticate, async (req, res) => {
   res.json({ wards, booths });
 });
 
-/** Wards with their booths, voter counts and assigned accounts. A Corporator sees only its own wards. */
+/**
+ * Wards with their booths, voter counts and assigned accounts. A Corporator sees only its own wards, its own
+ * team's voter counts and amount, and only itself and its own BLOs (never the ward's other Corporators). The
+ * Super Admin sees every Corporator of a ward, and counts for the team it is viewing (else the shared list).
+ */
 wardsRouter.get('/wards/summary', authenticate, requireWardManager, async (req, res) => {
-  const actor = auth(req).admin;
+  const { admin: actor, scope } = auth(req);
+  const team = scope.teamId;
+  const mine = actor.role === 'CORPORATOR' ? actor.id : null;
   const wards = (await pool.query<Ward & { paymentAmount: number | null; voterCount: number; adminIds: string[] }>(
-    `SELECT w.id, w.number, w.name, w.payment_amount AS "paymentAmount",
-       (SELECT count(*) FROM voters v WHERE v.ward_id = w.id) AS "voterCount",
+    `SELECT w.id, w.number, w.name,
+       ${mine ? '(SELECT ta.amount FROM team_ward_amounts ta WHERE ta.ward_id = w.id AND ta.team_id = $1)' : 'w.payment_amount'} AS "paymentAmount",
+       (SELECT count(*) FROM ${votersView('$1')} v WHERE v.ward_id = w.id AND NOT v.hidden) AS "voterCount",
        COALESCE((SELECT array_agg(a.id ORDER BY split_part(a.id, '-', 2)::int) FROM admin_wards aw JOIN admins a ON a.id = aw.admin_id
-                 WHERE aw.ward_id = w.id AND a.role = 'CORPORATOR'), '{}') AS "adminIds"
+                 WHERE aw.ward_id = w.id AND a.role = 'CORPORATOR' AND a.deleted_at IS NULL AND ($2::text IS NULL OR a.id = $2)), '{}') AS "adminIds"
      FROM wards w ORDER BY w.number`,
+    [team, mine],
   )).rows;
   const booths = (await pool.query<Booth & { voterCount: number; adminIds: string[] }>(
     `SELECT b.id, b.ward_id AS "wardId", b.number, b.name,
-       (SELECT count(*) FROM voters v WHERE v.booth_id = b.id) AS "voterCount",
+       (SELECT count(*) FROM ${votersView('$1')} v WHERE v.booth_id = b.id AND NOT v.hidden) AS "voterCount",
        COALESCE((SELECT array_agg(a.id ORDER BY split_part(a.id, '-', 2)::int) FROM admin_booths ab JOIN admins a ON a.id = ab.admin_id
-                 WHERE ab.booth_id = b.id AND a.role = 'BLO'), '{}') AS "adminIds"
+                 WHERE ab.booth_id = b.id AND a.role = 'BLO' AND a.deleted_at IS NULL AND ($2::text IS NULL OR a.corporator_id = $2)), '{}') AS "adminIds"
      FROM booths b ORDER BY b.number, b.id`,
+    [team, mine],
   )).rows;
   res.json(wards.filter((w) => ownsWard(actor, w.id)).map((w) => ({ ...w, booths: booths.filter((b) => b.wardId === w.id) })));
 });
@@ -133,22 +143,33 @@ wardsRouter.put('/wards/:id', authenticate, requireSuper, async (req, res) => {
 });
 
 /**
- * A ward's own payment amount for every voter in it (null = use the overall amount). Set by the ward's
- * Corporator or a Super Admin; applies to new payments only.
+ * A ward's own payment amount for every voter in it (null = use the overall amount). A Corporator sets it for its
+ * own team; the Super Admin sets the ward's amount, used by teams that have not set their own. Applies to new
+ * payments only.
  */
 wardsRouter.put('/wards/:id/payment-amount', authenticate, requireWardManager, async (req, res) => {
   const actor = auth(req).admin;
   const raw = req.body?.amount;
   const amount = raw === null || raw === '' ? null : Number(raw);
   if (amount !== null && !isValidAmount(amount)) fail(400, 'VALIDATION', 'Enter a valid amount.', { amount: 'Enter a whole amount between ₹1 and ₹1,00,000' });
+  const team = actor.role === 'CORPORATOR' ? actor.id : null;
   const result = await withTransaction(async (db) => {
     const ward = (await db.query<{ id: string; number: number; paymentAmount: number | null }>(
-      'SELECT id, number, payment_amount AS "paymentAmount" FROM wards WHERE id = $1 FOR UPDATE',
-      [str(req.params.id)],
+      `SELECT w.id, w.number, ${team ? '(SELECT amount FROM team_ward_amounts WHERE ward_id = w.id AND team_id = $2)' : 'w.payment_amount'} AS "paymentAmount"
+       FROM wards w WHERE w.id = $1 FOR UPDATE`,
+      team ? [str(req.params.id), team] : [str(req.params.id)],
     )).rows[0];
     if (!ward || !ownsWard(actor, ward.id)) fail(404, 'NOT_FOUND', 'Ward not found.');
     if (ward.paymentAmount !== amount) {
-      await db.query('UPDATE wards SET payment_amount = $1 WHERE id = $2', [amount, ward.id]);
+      if (!team) await db.query('UPDATE wards SET payment_amount = $1 WHERE id = $2', [amount, ward.id]);
+      else if (amount === null) await db.query('DELETE FROM team_ward_amounts WHERE ward_id = $1 AND team_id = $2', [ward.id, team]);
+      else {
+        await db.query(
+          `INSERT INTO team_ward_amounts (ward_id, team_id, amount) VALUES ($1, $2, $3)
+           ON CONFLICT (ward_id, team_id) DO UPDATE SET amount = $3`,
+          [ward.id, team, amount],
+        );
+      }
       const label = (n: number | null) => (n === null ? 'overall amount' : formatInr(n));
       await addAudit(db, actor, 'Ward payment amount changed', 'Ward', ward.id, `Ward ${ward.number}: ${label(ward.paymentAmount)} → ${label(amount)}`);
     }
@@ -191,13 +212,12 @@ wardsRouter.put('/booths/:id', authenticate, requireWardManager, async (req, res
 });
 
 /**
- * Sets the Corporator of a ward (a ward has at most one). Choosing a different Corporator moves the ward:
- * the previous Corporator, and its BLOs, lose it.
+ * Sets the Corporators of a ward. A ward can have several (they share its voter list; each keeps its own changes
+ * and payments). A Corporator taken off the ward loses it, and so do its BLOs.
  */
 wardsRouter.put('/wards/:id/admins', authenticate, requireSuper, async (req, res) => {
   const actor = auth(req).admin;
   const wanted = strArray(req.body?.adminIds);
-  if (wanted.length > 1) fail(400, 'VALIDATION', 'A ward has one Corporator. Choose only one.');
   await withTransaction(async (db) => {
     const ward = (await db.query<Ward>('SELECT id, number FROM wards WHERE id = $1 FOR UPDATE', [str(req.params.id)])).rows[0];
     if (!ward) fail(404, 'NOT_FOUND', 'Ward not found.');
