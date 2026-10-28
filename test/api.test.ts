@@ -17,6 +17,7 @@ interface VoterRow {
   status: string;
   houseNumber: string;
   address: string;
+  serialNumber: number | null;
 }
 
 async function voters(token: string, query: Record<string, unknown> = {}): Promise<VoterRow[]> {
@@ -780,6 +781,51 @@ describe('imports: existing voters', () => {
     // The Super Admin's file replaces the shared record.
     expect(await run(sa, true)).toMatchObject({ replaced: 1 });
     expect((await expectStatus(call('get', `/voters/${existing.recordId}`, sa), 200)).voter).toMatchObject({ voterId: row.voterId, fullName: 'Replaced Name' });
+  });
+
+  it('keeps the roll serial number (also filled in for kept voters) and lists voters in roll order', async () => {
+    const c2 = await login(C2_MOBILE);
+    const before = await voters(c2, { wardId: 'W3' });
+    const kept = before[before.length - 1];
+    const voter = (voterId: string, serialNumber: unknown) => ({
+      voterId,
+      fullName: `Roll ${voterId}`,
+      wardId: 'W3',
+      boothId: '',
+      houseNumber: '1-1',
+      householdId: '',
+      address: '',
+      status: 'Active',
+      serialNumber,
+    });
+    const run = async (token: string, rows: unknown[]) => {
+      const { importId } = await expectStatus(call('post', '/imports', token, { fileName: 'ward-roll.pdf' }), 201);
+      const batch = await expectStatus(call('post', `/imports/${importId}/rows`, token, { rows }), 200);
+      return { batch, done: await expectStatus(call('post', `/imports/${importId}/complete`, token, { skippedBeforeUpload: 0 }), 200) };
+    };
+    // Another Corporator cannot fill serial numbers outside its wards.
+    expect((await run(await login(C1_MOBILE), [{ rowNumber: 1, voter: voter(kept.voterId, 3), keep: true }])).batch).toMatchObject({ skipped: 1, serials: 0 });
+    const { batch, done } = await run(c2, [
+      { rowNumber: 1, voter: voter('SRL0000002', 2) },
+      { rowNumber: 2, voter: voter('SRL0000001', '1') },
+      { rowNumber: 3, voter: voter(kept.voterId, 3), keep: true },
+      { rowNumber: 4, voter: voter('SRL0000009', 'abc') },
+    ]);
+    expect(batch).toMatchObject({ imported: 2, skipped: 1, failed: 1, serials: 1 });
+    expect(batch.errors[0].message).toContain('Serial number');
+    expect(done).toMatchObject({ imported: 2, serials: 1 });
+    // Default order: the ward's numbered voters first (1, 2, 3), then those without a serial number.
+    const after = await voters(c2, { wardId: 'W3' });
+    expect(after.slice(0, 3).map((v) => [v.voterId, v.serialNumber])).toEqual([
+      ['SRL0000001', 1],
+      ['SRL0000002', 2],
+      [kept.voterId, 3],
+    ]);
+    expect(after.slice(3).every((v) => v.serialNumber === null)).toBe(true);
+    // The serial number is shared: a Corporator's voter form leaves it as it is.
+    const edited = { ...after[0], serialNumber: 99 };
+    await expectStatus(call('put', `/voters/${edited.recordId}`, c2, edited), 200);
+    expect((await expectStatus(call('get', `/voters/${edited.recordId}`, c2), 200)).voter.serialNumber).toBe(1);
   });
 });
 

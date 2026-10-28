@@ -58,6 +58,8 @@ function voterOrder(q: Request['query']): string {
   const dir = q.sortDir === 'desc' ? 'DESC' : 'ASC';
   const text = (col: string) => `lower(${col}) COLLATE natural_sort ${dir}`;
   const keys: Record<string, string> = {
+    // Ward by ward in roll order; voters without a serial number come after the ward's numbered ones.
+    serialNumber: `w.number ${dir}, v.serial_number ${dir} NULLS LAST, ${text('v.voter_id')}`,
     ward: `w.number ${dir}, b.number ${dir} NULLS FIRST`,
     booth: `b.number ${dir} NULLS FIRST`,
     voterId: text('v.voter_id'),
@@ -65,8 +67,8 @@ function voterOrder(q: Request['query']): string {
     houseNumber: text('v.house_number'),
     status: text('v.status'),
   };
-  // Voter ID order by default (the EPIC number printed on the roll).
-  return `ORDER BY ${keys[str(q.sortBy)] ?? keys.voterId}, v.record_id`;
+  // Roll order by default (ward, then the serial number printed in each voter box).
+  return `ORDER BY ${keys[str(q.sortBy)] ?? keys.serialNumber}, v.record_id`;
 }
 
 votersRouter.get('/voters', authenticate, async (req, res) => {
@@ -198,6 +200,7 @@ const FIELD_LABELS: Record<keyof VoterInput, string> = {
   boothId: 'booth',
   houseNumber: 'house number',
   householdId: 'household ID',
+  serialNumber: 'serial number',
   address: 'address',
   status: 'status',
   age: 'age',
@@ -280,6 +283,8 @@ votersRouter.put('/voters/:recordId', authenticate, requireWardManager, async (r
     if (!ownsWard(actor, current.wardId)) fail(404, 'NOT_FOUND', 'Voter not found.');
     const input = await validateVoterInput(db, await loadLocationRefs(db), req.body ?? {}, current.recordId);
     assertOwnWard(actor, input.wardId);
+    // The serial number belongs to the roll and is shared: a Corporator's form does not change it (imports do).
+    if (team) input.serialNumber = current.serialNumber;
     const changed = (Object.keys(FIELD_LABELS) as (keyof VoterInput)[]).filter((k) => k !== 'status' && current[k] !== input[k]).map((k) => FIELD_LABELS[k]);
     const statusChange = current.status !== input.status ? `${current.status} → ${input.status}` : '';
     const updated = team ? await saveTeamVoter(db, team, current, input) : await updateVoter(db, current.recordId, input);

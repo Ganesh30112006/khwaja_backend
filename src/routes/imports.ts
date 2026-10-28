@@ -6,7 +6,16 @@ import { ApiError, fail } from '../lib/errors.js';
 import { str } from '../lib/validation.js';
 import { auth, authenticate, requireWardManager } from '../middleware/auth.js';
 import { ownsWard } from '../lib/admins.js';
-import { findVoterByVoterId, insertVoter, loadLocationRefs, saveTeamVoter, updateVoter, validateVoterInput } from '../services/voters.js';
+import {
+  findVoterByVoterId,
+  insertVoter,
+  loadLocationRefs,
+  parseSerialNumber,
+  saveTeamVoter,
+  setSerialNumber,
+  updateVoter,
+  validateVoterInput,
+} from '../services/voters.js';
 
 export const importsRouter = Router();
 importsRouter.use('/imports', authenticate, requireWardManager);
@@ -20,6 +29,8 @@ interface ImportResult {
   replaced: number;
   skipped: number;
   failed: number;
+  /** Voters that were kept (not replaced) but got their serial number from the file. */
+  serials: number;
   errors: { rowNumber: number; message: string }[];
 }
 
@@ -69,6 +80,10 @@ async function findJob(id: string, adminId: string, message: string) {
  * (`replace: true`): then a Corporator's file replaces that voter's details for its own team only, and the Super
  * Admin's file replaces the shared details (payments stay with the voter). Corporators can only import into, and
  * replace voters in, their own wards. Any other problem fails that row.
+ *
+ * The serial number comes from the roll and is shared, so it is set from the file for every team, also for an
+ * existing voter the user chose to keep (`keep: true`: only the serial number is used, and only when the voter is
+ * in the caller's wards and in the same ward as the row).
  */
 importsRouter.post('/imports/:id/rows', async (req, res) => {
   const { admin } = auth(req);
@@ -78,11 +93,22 @@ importsRouter.post('/imports/:id/rows', async (req, res) => {
   const rows: unknown[] = Array.isArray(req.body?.rows) ? req.body.rows : [];
   if (rows.length > MAX_BATCH_ROWS) fail(400, 'VALIDATION', `Send at most ${MAX_BATCH_ROWS} rows per batch.`);
   const refs = await loadLocationRefs(pool);
-  const result: ImportResult = { imported: 0, replaced: 0, skipped: 0, failed: 0, errors: [] };
+  const result: ImportResult = { imported: 0, replaced: 0, skipped: 0, failed: 0, serials: 0, errors: [] };
   for (const raw of rows) {
-    const row = (raw ?? {}) as { rowNumber?: unknown; voter?: unknown; replace?: unknown };
+    const row = (raw ?? {}) as { rowNumber?: unknown; voter?: unknown; replace?: unknown; keep?: unknown };
     const rowNumber = Number.isInteger(row.rowNumber) ? (row.rowNumber as number) : 0;
     const body = (row.voter ?? {}) as Record<string, unknown>;
+    if (row.keep === true) {
+      const filled = await withTransaction(async (db) => {
+        const kept = await findVoterByVoterId(db, str(body.voterId), true, team);
+        const serial = parseSerialNumber(body.serialNumber);
+        if (!kept || !ownsWard(admin, kept.wardId) || kept.wardId !== str(body.wardId) || serial === null || Number.isNaN(serial)) return false;
+        return setSerialNumber(db, kept.recordId, serial);
+      });
+      result.skipped++;
+      if (filled) result.serials++;
+      continue;
+    }
     try {
       const outcome = await withTransaction(async (db) => {
         const existing = row.replace === true ? await findVoterByVoterId(db, String(body.voterId ?? ''), true, team) : undefined;
@@ -92,8 +118,14 @@ importsRouter.post('/imports/:id/rows', async (req, res) => {
         const input = await validateVoterInput(db, refs, body, existing?.recordId);
         if (!ownsWard(admin, input.wardId)) fail(403, 'FORBIDDEN', `Ward ${wardNumbers.get(input.wardId) ?? '?'} is not assigned to you.`);
         if (existing) {
-          if (team) await saveTeamVoter(db, team, existing, input);
-          else await updateVoter(db, existing.recordId, input);
+          // A file without serial numbers keeps the voter's own.
+          if (input.serialNumber === null) input.serialNumber = existing.serialNumber;
+          if (team) {
+            await saveTeamVoter(db, team, existing, input);
+            if (input.serialNumber !== null) await setSerialNumber(db, existing.recordId, input.serialNumber);
+          } else {
+            await updateVoter(db, existing.recordId, input);
+          }
           return 'replaced' as const;
         }
         await insertVoter(db, input);
@@ -108,8 +140,8 @@ importsRouter.post('/imports/:id/rows', async (req, res) => {
     }
   }
   await pool.query(
-    'UPDATE import_jobs SET imported = imported + $2, replaced = replaced + $3, skipped = skipped + $4, failed = failed + $5, errors = errors || $6::jsonb WHERE id = $1',
-    [str(req.params.id), result.imported, result.replaced, result.skipped, result.failed, JSON.stringify(result.errors)],
+    'UPDATE import_jobs SET imported = imported + $2, replaced = replaced + $3, skipped = skipped + $4, failed = failed + $5, serials = serials + $6, errors = errors || $7::jsonb WHERE id = $1',
+    [str(req.params.id), result.imported, result.replaced, result.skipped, result.failed, result.serials, JSON.stringify(result.errors)],
   );
   res.json(result);
 });
@@ -119,20 +151,28 @@ importsRouter.post('/imports/:id/complete', async (req, res) => {
   const skippedBefore = Math.max(0, Math.floor(Number(req.body?.skippedBeforeUpload)) || 0);
   const total = await withTransaction(async (db) => {
     const job = UUID.test(str(req.params.id))
-      ? (await db.query<{ fileName: string; imported: number; replaced: number; skipped: number; failed: number; errors: ImportResult['errors'] }>(
-          'DELETE FROM import_jobs WHERE id = $1 AND admin_id = $2 RETURNING file_name AS "fileName", imported, replaced, skipped, failed, errors',
+      ? (await db.query<{ fileName: string; imported: number; replaced: number; skipped: number; failed: number; serials: number; errors: ImportResult['errors'] }>(
+          'DELETE FROM import_jobs WHERE id = $1 AND admin_id = $2 RETURNING file_name AS "fileName", imported, replaced, skipped, failed, serials, errors',
           [str(req.params.id), admin.id],
         )).rows[0]
       : undefined;
     if (!job) fail(404, 'NOT_FOUND', 'Import session not found.');
-    const result: ImportResult = { imported: job.imported, replaced: job.replaced, skipped: job.skipped + skippedBefore, failed: job.failed, errors: job.errors };
+    const result: ImportResult = {
+      imported: job.imported,
+      replaced: job.replaced,
+      skipped: job.skipped + skippedBefore,
+      failed: job.failed,
+      serials: job.serials,
+      errors: job.errors,
+    };
     await addAudit(
       db,
       admin,
       'Voters imported',
       'Import',
       job.fileName,
-      `${result.imported} imported, ${result.replaced} replaced, ${result.skipped} skipped, ${result.failed} failed`,
+      `${result.imported} imported, ${result.replaced} replaced, ${result.skipped} skipped, ${result.failed} failed` +
+        (result.serials ? `, ${result.serials} serial numbers filled` : ''),
       result.imported > 0 || result.replaced > 0 || result.failed === 0 ? 'Success' : 'Failure',
     );
     return result;

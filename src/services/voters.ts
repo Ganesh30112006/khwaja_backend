@@ -19,6 +19,8 @@ export interface VoterInput {
   age: number | null;
   /** As printed on the roll (లింగము); '' when unknown. */
   gender: Gender;
+  /** Serial number in the ward roll (shared by every team); null when unknown. */
+  serialNumber: number | null;
 }
 
 export interface Voter extends VoterInput {
@@ -41,7 +43,7 @@ export interface VoterListItem extends Voter {
  */
 export function votersView(team: string): string {
   const own = (col: string) => `CASE WHEN o.details THEN o.${col} ELSE b.${col} END AS ${col}`;
-  return `(SELECT b.record_id, b.voter_id, b.ward_id, b.created_at, COALESCE(o.updated_at, b.updated_at) AS updated_at,
+  return `(SELECT b.record_id, b.voter_id, b.ward_id, b.serial_number, b.created_at, COALESCE(o.updated_at, b.updated_at) AS updated_at,
       ${['full_name', 'booth_id', 'house_number', 'household_id', 'address', 'age', 'gender'].map(own).join(', ')},
       COALESCE(o.status, b.status) AS status, COALESCE(o.hidden, false) AS hidden
     FROM voters b LEFT JOIN voter_overrides o ON o.voter_record_id = b.record_id AND o.team_id = ${team})`;
@@ -49,7 +51,7 @@ export function votersView(team: string): string {
 
 export const VOTER_COLUMNS = `v.record_id AS "recordId", v.voter_id AS "voterId", v.full_name AS "fullName",
   v.ward_id AS "wardId", COALESCE(v.booth_id, '') AS "boothId", v.house_number AS "houseNumber", v.household_id AS "householdId",
-  v.address, v.status, v.age, v.gender, v.created_at AS "createdAt", v.updated_at AS "updatedAt"`;
+  v.address, v.status, v.age, v.gender, v.serial_number AS "serialNumber", v.created_at AS "createdAt", v.updated_at AS "updatedAt"`;
 
 /** Ward → booth IDs, loaded once per request (imports validate many rows against it). */
 export type LocationRefs = Map<string, Set<string>>;
@@ -79,6 +81,7 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   const ageRaw = body.age === null || body.age === undefined ? '' : String(body.age).trim();
   const age = ageRaw === '' ? null : Number(ageRaw);
   const gender = str(body.gender) as Gender;
+  const serialNumber = parseSerialNumber(body.serialNumber);
 
   if (!voterId) errors.voterId = 'Voter ID is required';
   else if (voterId.length > 30) errors.voterId = 'Voter ID is too long';
@@ -92,6 +95,7 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   if (!VOTER_STATUSES.includes(status)) errors.status = 'Select a voter status';
   if (age !== null && (!Number.isInteger(age) || age < 18 || age > 120)) errors.age = 'Age must be a whole number from 18 to 120';
   if (gender && !(GENDERS as readonly string[]).includes(gender)) errors.gender = 'Choose Male, Female or Other';
+  if (Number.isNaN(serialNumber)) errors.serialNumber = 'Serial number must be a whole number from 1 to 999999';
   if (householdId) {
     if (householdId.length > 30) errors.householdId = 'Household ID is too long';
     else if (!HOUSEHOLD_ID_PATTERN.test(householdId)) errors.householdId = 'Use letters, numbers, - or / only';
@@ -106,7 +110,21 @@ export async function validateVoterInput(db: Db, refs: LocationRefs, body: Recor
   failIfErrors(errors);
   const { rowCount } = await db.query('SELECT 1 FROM voters WHERE upper(voter_id) = upper($1) AND record_id <> $2', [voterId, excludeRecordId ?? '']);
   if (rowCount) throw voterIdConflict();
-  return { voterId, fullName, wardId, boothId, houseNumber, householdId, address, status, age, gender };
+  return { voterId, fullName, wardId, boothId, houseNumber, householdId, address, status, age, gender, serialNumber };
+}
+
+/** Sets a voter's shared serial number from an imported roll. True when it changed. */
+export async function setSerialNumber(db: Db, recordId: string, serialNumber: number): Promise<boolean> {
+  const { rowCount } = await db.query('UPDATE voters SET serial_number = $2 WHERE record_id = $1 AND serial_number IS DISTINCT FROM $2', [recordId, serialNumber]);
+  return (rowCount ?? 0) > 0;
+}
+
+/** A serial number from a form or file: null when empty, NaN when not a whole number from 1 to 999999. */
+export function parseSerialNumber(raw: unknown): number | null {
+  const text = raw === null || raw === undefined ? '' : String(raw).trim();
+  if (text === '') return null;
+  const n = Number(text);
+  return Number.isInteger(n) && n >= 1 && n <= 999999 ? n : NaN;
 }
 
 export function voterIdConflict(): ApiError {
@@ -220,9 +238,9 @@ export async function updateVoter(db: Db, recordId: string, input: VoterInput): 
   const { rows } = await db
     .query<Voter>(
       `UPDATE voters v SET voter_id = $2, full_name = $3, ward_id = $4, booth_id = NULLIF($5, ''), house_number = $6, household_id = $7,
-         address = $8, status = $9, age = $10, gender = $11, updated_at = now()
+         address = $8, status = $9, age = $10, gender = $11, serial_number = $12, updated_at = now()
        WHERE record_id = $1 RETURNING ${VOTER_COLUMNS}`,
-      [recordId, input.voterId, input.fullName, input.wardId, input.boothId, input.houseNumber, input.householdId, input.address, input.status, input.age, input.gender],
+      [recordId, input.voterId, input.fullName, input.wardId, input.boothId, input.houseNumber, input.householdId, input.address, input.status, input.age, input.gender, input.serialNumber],
     )
     .catch((err) => {
       if (isUniqueViolation(err, 'voters_voter_id_ci_idx')) throw voterIdConflict();
@@ -236,9 +254,9 @@ export async function insertVoter(db: Db, input: VoterInput): Promise<Voter> {
   const recordId = `VR-${pad(await nextNumber(db, 'voter'), 6)}`;
   const { rows } = await db
     .query<Voter>(
-      `INSERT INTO voters AS v (record_id, voter_id, full_name, ward_id, booth_id, house_number, household_id, address, status, age, gender, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11, now(), now()) RETURNING ${VOTER_COLUMNS}`,
-      [recordId, input.voterId, input.fullName, input.wardId, input.boothId, input.houseNumber, input.householdId, input.address, input.status, input.age, input.gender],
+      `INSERT INTO voters AS v (record_id, voter_id, full_name, ward_id, booth_id, house_number, household_id, address, status, age, gender, serial_number, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11, $12, now(), now()) RETURNING ${VOTER_COLUMNS}`,
+      [recordId, input.voterId, input.fullName, input.wardId, input.boothId, input.houseNumber, input.householdId, input.address, input.status, input.age, input.gender, input.serialNumber],
     )
     .catch((err) => {
       if (isUniqueViolation(err, 'voters_voter_id_ci_idx')) throw voterIdConflict();
