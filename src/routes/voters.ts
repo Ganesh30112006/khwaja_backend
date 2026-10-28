@@ -5,7 +5,7 @@ import { fail } from '../lib/errors.js';
 import { addAudit } from '../lib/audit.js';
 import { pageWindow } from '../lib/pagination.js';
 import { likePattern, str, strArray, VOTER_STATUSES, type VoterStatus } from '../lib/validation.js';
-import { auth, authenticate, requireWardManager } from '../middleware/auth.js';
+import { auth, authenticate, requireSuper, requireWardManager } from '../middleware/auth.js';
 import { TXN_SELECT, txnFor, type PaymentTransaction } from '../services/payments.js';
 import {
   hideForTeam,
@@ -230,6 +230,44 @@ votersRouter.delete('/voters/:recordId', authenticate, requireWardManager, async
     await addAudit(db, actor, 'Voter removed', 'Voter', voter.voterId, `${voter.fullName}, ${await locationLabel(db, voter)}`);
   });
   res.status(204).end();
+});
+
+/**
+ * Deletes every voter of a ward, for everyone (Super Admin only). Voters with a successful payment (any team) are
+ * kept unless `includePaid=true`; then they go too, with all their payments. Other payments (cancelled) go with
+ * their voters, as on a single removal.
+ */
+votersRouter.delete('/wards/:wardId/voters', authenticate, requireSuper, async (req, res) => {
+  const actor = auth(req).admin;
+  const includePaid = req.query.includePaid === 'true';
+  const result = await withTransaction(async (db) => {
+    const ward = (await db.query<{ id: string; number: string; name: string }>('SELECT id, number, name FROM wards WHERE id = $1 FOR UPDATE', [str(req.params.wardId)]))
+      .rows[0];
+    if (!ward) fail(404, 'NOT_FOUND', 'Ward not found.');
+    const rows = (
+      await db.query<{ record_id: string; paid: boolean }>(
+        `SELECT v.record_id,
+                EXISTS (SELECT 1 FROM payment_transactions t WHERE t.voter_record_id = v.record_id AND t.status = 'Success') AS paid
+           FROM voters v WHERE v.ward_id = $1 FOR UPDATE OF v`,
+        [ward.id],
+      )
+    ).rows;
+    const ids = rows.filter((r) => includePaid || !r.paid).map((r) => r.record_id);
+    const paidDeleted = includePaid ? rows.filter((r) => r.paid).length : 0;
+    const keptPaid = rows.length - ids.length;
+    if (ids.length) {
+      await db.query('DELETE FROM idempotency_keys WHERE txn_id IN (SELECT id FROM payment_transactions WHERE voter_record_id = ANY($1))', [ids]);
+      await db.query('DELETE FROM payment_transactions WHERE voter_record_id = ANY($1)', [ids]);
+      await db.query('DELETE FROM voters WHERE record_id = ANY($1)', [ids]);
+    }
+    const summary =
+      `Ward ${ward.number} – ${ward.name}: ${ids.length} voter${ids.length === 1 ? '' : 's'} deleted` +
+      (paidDeleted ? `, including ${paidDeleted} paid voter${paidDeleted === 1 ? '' : 's'} and their payments` : '') +
+      (keptPaid ? `, ${keptPaid} paid voter${keptPaid === 1 ? '' : 's'} kept` : '');
+    await addAudit(db, actor, 'Ward voters deleted', 'Ward', ward.id, summary);
+    return { deleted: ids.length, paidDeleted, keptPaid };
+  });
+  res.json(result);
 });
 
 /** Edits a voter: a Corporator's edit applies to its own team only; the Super Admin edits the shared record. */

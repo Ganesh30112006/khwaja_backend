@@ -305,6 +305,40 @@ describe('payments', () => {
     expect(audit.items[0]).toMatchObject({ action: 'Voter removed', adminId: 'C-1' });
   });
 
+  it('deletes all voters of a ward (Super Admin): paid voters only when asked again, with their payments', async () => {
+    const sa = await login(SUPER_MOBILE);
+    const c1 = await login(C1_MOBILE);
+    const paid = await notReceivedVoter(c1);
+    const ward = paid.wardId;
+    await expectStatus(call('post', '/payments', c1, pay(paid.recordId, 'ward-del')), 201);
+    const inWard = (await voters(sa, { wardId: ward })).length;
+    const elsewhere = (await voters(sa)).length - inWard;
+    expect(inWard).toBeGreaterThan(1);
+    await expectStatus(call('delete', `/wards/${ward}/voters`, c1), 403);
+    await expectStatus(call('delete', '/wards/NOPE/voters', sa), 404);
+    // First the voters without a payment; the paid ones (this one and the sample data's) stay.
+    const first = await expectStatus(call('delete', `/wards/${ward}/voters`, sa), 200);
+    expect(first.paidDeleted).toBe(0);
+    expect(first.keptPaid).toBeGreaterThanOrEqual(1);
+    expect(first.deleted + first.keptPaid).toBe(inWard);
+    const left = await voters(sa, { wardId: ward });
+    expect(left.length).toBe(first.keptPaid);
+    expect(left.map((v) => v.recordId)).toContain(paid.recordId);
+    // Then, when asked, the paid voters and their payments.
+    expect(await expectStatus(call('delete', `/wards/${ward}/voters`, sa, undefined, { includePaid: 'true' }), 200)).toEqual({
+      deleted: first.keptPaid,
+      paidDeleted: first.keptPaid,
+      keptPaid: 0,
+    });
+    expect(await voters(sa, { wardId: ward })).toEqual([]);
+    expect((await voters(sa)).length).toBe(elsewhere);
+    const payments = await expectStatus(call('get', '/payments', c1, undefined, { pageSize: 500 }), 200);
+    expect(payments.items.some((p: { voterId: string }) => p.voterId === paid.voterId)).toBe(false);
+    const audit = await expectStatus(call('get', '/audit-logs', sa, undefined, { recordRef: ward }), 200);
+    expect(audit.items[0]).toMatchObject({ action: 'Ward voters deleted', adminId: 'SA-1' });
+    expect(audit.items[0].summary).toContain('paid voter');
+  });
+
   it('only Active voters can be paid; a deaths / shifted list updates statuses in bulk', async () => {
     const sa = await login(SUPER_MOBILE);
     const [a, b] = await voters(sa, { paymentStatus: 'Not Received', status: 'Active', wardId: 'W1', pageSize: 2 });
