@@ -83,14 +83,14 @@ jobs:
             sleep 5
           done
           [ "$STATUS" = "PROCESSED" ] || { echo "Application version not ready (status $STATUS)"; exit 1; }
-          aws elasticbeanstalk wait environment-updated --environment-names "$EB_ENV"
+          aws elasticbeanstalk wait environment-updated --environment-names "$EB_ENV" --no-include-deleted
           aws elasticbeanstalk update-environment --environment-name "$EB_ENV" --version-label "$VERSION"
           # Immutable deploys start new servers first and can take longer than the CLI waiter's ~7 minutes.
           for i in $(seq 1 90); do
             sleep 20
-            [ "$(aws elasticbeanstalk describe-environments --environment-names "$EB_ENV" --query 'Environments[0].Status' --output text)" = "Ready" ] && break
+            [ "$(aws elasticbeanstalk describe-environments --environment-names "$EB_ENV" --no-include-deleted --query 'Environments[0].Status' --output text)" = "Ready" ] && break
           done
-          read -r DEPLOYED HEALTH <<<"$(aws elasticbeanstalk describe-environments --environment-names "$EB_ENV" \
+          read -r DEPLOYED HEALTH <<<"$(aws elasticbeanstalk describe-environments --environment-names "$EB_ENV" --no-include-deleted \
             --query 'Environments[0].[VersionLabel,Health]' --output text)"
           echo "Deployed $DEPLOYED, health $HEALTH"
           test "$DEPLOYED" = "$VERSION"
