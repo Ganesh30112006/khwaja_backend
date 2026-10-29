@@ -7,12 +7,14 @@ import { ADMIN_SELECT, deviceLabel, NAME_KEY_SQL, nameKey, type Admin } from '..
 import { addAudit } from '../lib/audit.js';
 import { fail } from '../lib/errors.js';
 import { hashPassword, passwordTakenError, passwordTakenForName, verifyDummy, verifyPassword } from '../lib/password.js';
+import { PgRateLimitStore } from '../lib/rateLimitStore.js';
 import { isValidIndianMobile, isValidPassword, normalizeMobile, PASSWORD_RULES, str } from '../lib/validation.js';
 import { auth, authenticate, bearerToken, hashToken, newToken } from '../middleware/auth.js';
 
 export const authRouter = Router();
 
 const loginLimiter = rateLimit({
+  store: new PgRateLimitStore('login:'),
   windowMs: 15 * 60 * 1000,
   limit: config.loginRateLimit,
   standardHeaders: 'draft-7',
@@ -26,6 +28,7 @@ const loginLimiter = rateLimit({
  * change attempt is counted per account (right or wrong current password, accepted or not).
  */
 const passwordChangeLimiter = rateLimit({
+  store: new PgRateLimitStore('password-change:'),
   windowMs: 60 * 60 * 1000,
   limit: 10,
   standardHeaders: 'draft-7',

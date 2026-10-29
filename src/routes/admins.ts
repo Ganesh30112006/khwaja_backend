@@ -8,6 +8,7 @@ import { fail, failIfErrors } from '../lib/errors.js';
 import { nextNumber } from '../lib/ids.js';
 import { pageWindow } from '../lib/pagination.js';
 import { hashPassword, passwordTakenError, passwordTakenForName } from '../lib/password.js';
+import { PgRateLimitStore } from '../lib/rateLimitStore.js';
 import { isValidIndianMobile, isValidPassword, likePattern, normalizeMobile, PASSWORD_RULES, str, strArray } from '../lib/validation.js';
 import { auth, authenticate, requireManager, requireSuper } from '../middleware/auth.js';
 
@@ -19,6 +20,7 @@ adminsRouter.use('/admins', authenticate, requireManager);
  * counted (an accepted password is a wrong guess too), per signed-in account.
  */
 const passwordWriteLimiter = rateLimit({
+  store: new PgRateLimitStore('password-write:'),
   windowMs: 60 * 60 * 1000,
   limit: 30,
   standardHeaders: 'draft-7',
