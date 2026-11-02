@@ -913,6 +913,27 @@ describe('wards, reports and audit', () => {
     await expectStatus(call('get', '/cash/C-1-BLO1', await login(C2_MOBILE)), 404);
     await expectStatus(call('get', '/cash/C-1-BLO2', blo), 404);
     await expectStatus(call('get', '/cash/C-1', c1), 404);
+
+    // The Corporator corrects an earlier entry at any time; the total given never goes below zero.
+    const first = (await expectStatus(call('get', '/cash/C-1-BLO1', c1), 200)).history.find((h: { note: string }) => h.note === 'First bundle');
+    const edited = await expectStatus(call('put', `/cash/C-1-BLO1/${first.id}`, c1, { amount: 12000, note: 'Corrected' }), 200);
+    expect(edited.given).toBe(8000);
+    expect(edited.history.find((h: { id: string }) => h.id === first.id)).toMatchObject({ amount: 12000, note: 'Corrected', editedAt: expect.any(String) });
+    await expectStatus(call('put', `/cash/C-1-BLO1/${first.id}`, c1, { amount: 3999 }), 400);
+    await expectStatus(call('put', `/cash/C-1-BLO1/${first.id}`, c1, { amount: 0 }), 400);
+    await expectStatus(call('put', `/cash/C-1-BLO1/${first.id}`, sa, { amount: 100 }), 403);
+    await expectStatus(call('put', `/cash/C-1-BLO1/${first.id}`, blo, { amount: 100 }), 403);
+    await expectStatus(call('put', `/cash/C-1-BLO2/${first.id}`, c1, { amount: 100 }), 404);
+    await expectStatus(call('put', '/cash/C-1-BLO1/abc', c1, { amount: 100 }), 404);
+
+    // Excel download data: a Corporator gets its own BLOs, a BLO itself, the Super Admin every BLO.
+    const mine = await expectStatus(call('get', '/cash', c1), 200);
+    expect(mine.blos.every((b: { corporatorId: string }) => b.corporatorId === 'C-1')).toBe(true);
+    expect(mine.blos.find((b: { id: string }) => b.id === 'C-1-BLO1')).toMatchObject({ given: 8000, left: 8000 - start.spent - 2000 });
+    expect(mine.entries.filter((e: { bloId: string }) => e.bloId === 'C-1-BLO1')).toHaveLength(2);
+    expect((await expectStatus(call('get', '/cash', blo), 200)).blos.map((b: { id: string }) => b.id)).toEqual(['C-1-BLO1']);
+    expect((await expectStatus(call('get', '/cash?bloId=C-1-BLO1', await login(C2_MOBILE)), 200))).toEqual({ blos: [], entries: [] });
+    expect((await expectStatus(call('get', '/cash', sa), 200)).blos.length).toBeGreaterThanOrEqual(mine.blos.length);
   });
 
   it('shows the Super Admin and its Corporator how much a BLO has given out', async () => {
